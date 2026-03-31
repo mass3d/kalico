@@ -39,6 +39,8 @@ SOURCE_FILES = [
     "kin_extruder.c",
     "kin_shaper.c",
     "kin_idex.c",
+    "phase_generate.c",
+    "phase_compress.c",
 ]
 DEST_LIB = "c_helper.so"
 OTHER_FILES = [
@@ -50,6 +52,8 @@ OTHER_FILES = [
     "trapq.h",
     "pollreactor.h",
     "msgblock.h",
+    "phase_generate.h",
+    "phase_compress.h",
 ]
 
 defs_stepcompress = """
@@ -101,12 +105,14 @@ defs_itersolve = """
     void itersolve_set_position(struct stepper_kinematics *sk
         , double x, double y, double z);
     double itersolve_get_commanded_pos(struct stepper_kinematics *sk);
+    void itersolve_set_commanded_pos(struct stepper_kinematics *sk
+        , double pos);
 """
 
 defs_trapq = """
     struct pull_move {
         double print_time, move_t;
-        double start_v, accel;
+        double start_v, accel, jerk;
         double start_x, start_y, start_z;
         double x_r, y_r, z_r;
     };
@@ -118,6 +124,13 @@ defs_trapq = """
         , double start_pos_x, double start_pos_y, double start_pos_z
         , double axes_r_x, double axes_r_y, double axes_r_z
         , double start_v, double cruise_v, double accel);
+    void trapq_append_scurve(struct trapq *tq, double print_time
+        , double start_pos_x, double start_pos_y, double start_pos_z
+        , double axes_r_x, double axes_r_y, double axes_r_z
+        , double start_v, double jerk_max
+        , double accel_max, double cruise_v
+        , double tj1, double ta, double tc
+        , double tj2, double td);
     void trapq_finalize_moves(struct trapq *tq, double print_time
         , double clear_history_time);
     void trapq_set_position(struct trapq *tq, double print_time
@@ -236,6 +249,57 @@ defs_pyhelper = """
     double get_monotonic(void);
 """
 
+defs_phase_generate = """
+    struct phase_sample {
+        double time;
+        double position;
+    };
+
+    struct phase_generator *phase_generator_alloc(void);
+    void phase_generator_set_time(struct phase_generator *pg, double time);
+    void phase_generator_set_last_position(struct phase_generator *pg
+        , double pos);
+    void phase_generator_set_offset(struct phase_generator *pg, double offset);
+    void phase_generator_set_direction(struct phase_generator *pg, double dir);
+    void phase_generator_config(struct phase_generator *pg
+        , struct stepper_kinematics *sk
+        , double step_dist, double update_interval);
+    int phase_generator_generate(struct phase_generator *pg
+        , double flush_time
+        , struct phase_sample *samples, int max_samples);
+    int phase_generator_extract_positions(struct phase_sample *samples
+        , int num_samples, double *positions);
+    int phase_generator_find_move_start(double *positions, int num_samples
+        , double threshold);
+"""
+
+defs_phase_compress = """
+    struct phase_compressed_move {
+        double start_position;
+        double velocity;
+        double acceleration;
+        int count;
+    };
+
+    struct phase_compressor *phase_compressor_alloc(void);
+    void phase_compressor_set_max_error(struct phase_compressor *pc
+        , double max_error);
+    int phase_compressor_compress(struct phase_compressor *pc
+        , double *positions, int num_samples
+        , struct phase_compressed_move *out, int max_out);
+
+    struct phase_mcu_move {
+        int32_t start_position;
+        int32_t velocity;
+        int32_t acceleration;
+        uint16_t count;
+    };
+
+    int phase_compressor_to_fixed(struct phase_compressed_move *segments
+        , int num_segments
+        , struct phase_mcu_move *out_mcu, int max_out);
+"""
+
 defs_std = """
     void free(void*);
 """
@@ -259,6 +323,8 @@ defs_all = [
     defs_kin_extruder,
     defs_kin_shaper,
     defs_kin_idex,
+    defs_phase_generate,
+    defs_phase_compress,
 ]
 
 
