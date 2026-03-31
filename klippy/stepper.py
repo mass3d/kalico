@@ -4,6 +4,7 @@
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import collections
+import logging
 import math
 
 from . import chelper
@@ -64,6 +65,7 @@ class MCU_stepper:
         self._itersolve_generate_steps = ffi_lib.itersolve_generate_steps
         self._itersolve_check_active = ffi_lib.itersolve_check_active
         self._trapq = ffi_main.NULL
+        self._phase_stepping = False
         self._mcu.get_printer().register_event_handler(
             "klippy:connect", self._query_mcu_position
         )
@@ -214,6 +216,10 @@ class MCU_stepper:
         ffi_main, ffi_lib = chelper.get_ffi()
         return ffi_lib.itersolve_get_commanded_pos(self._stepper_kinematics)
 
+    def set_commanded_position(self, cmd_pos):
+        ffi_main, ffi_lib = chelper.get_ffi()
+        ffi_lib.itersolve_set_commanded_pos(self._stepper_kinematics, cmd_pos)
+
     def get_mcu_position(self, cmd_pos=None):
         if cmd_pos is None:
             cmd_pos = self.get_commanded_position()
@@ -270,6 +276,30 @@ class MCU_stepper:
             raise error("Internal error in stepcompress")
         self._query_mcu_position()
 
+    def sync_commanded_position(self, print_time, cmd_pos=None):
+        ffi_main, ffi_lib = chelper.get_ffi()
+        ret = ffi_lib.stepcompress_reset(self._stepqueue, 0)
+        if ret:
+            raise error("Internal error in stepcompress")
+        data = (self._reset_cmd_tag, self._oid, 0)
+        ret = ffi_lib.stepcompress_queue_msg(self._stepqueue, data, len(data))
+        if ret:
+            raise error("Internal error in stepcompress")
+        clock = self._mcu.print_time_to_clock(print_time)
+        if cmd_pos is not None:
+            self.set_commanded_position(cmd_pos)
+        else:
+            cmd_pos = self.get_commanded_position()
+        mcu_pos = self.get_mcu_position(cmd_pos)
+        ret = ffi_lib.stepcompress_set_last_position(
+            self._stepqueue, clock, mcu_pos
+        )
+        if ret:
+            raise error("Internal error in stepcompress")
+        mcu_pos_dist = mcu_pos * self._step_dist
+        self._mcu_position_offset = mcu_pos_dist - cmd_pos
+        self._mcu.get_printer().send_event("stepper:sync_mcu_position", self)
+
     def _query_mcu_position(self):
         if self._mcu.is_fileoutput() or self._mcu.non_critical_disconnected:
             return
@@ -303,7 +333,12 @@ class MCU_stepper:
     def add_active_callback(self, cb):
         self._active_callbacks.append(cb)
 
+    def set_phase_stepping(self, active):
+        self._phase_stepping = active
     def generate_steps(self, flush_time):
+        # Skip step/dir generation when phase stepping handles positioning
+        if self._phase_stepping:
+            return
         # Check for activity if necessary
         if self._active_callbacks:
             sk = self._stepper_kinematics
@@ -354,7 +389,38 @@ def PrinterStepper(config, units_in_radians=False):
     for mname in ["stepper_enable", "force_move", "motion_report"]:
         m = printer.load_object(config, mname)
         m.register_stepper(config, mcu_stepper)
+    # Check for phase stepping on associated TMC driver
+    _check_phase_stepping(config, printer, mcu_stepper)
     return mcu_stepper
+
+
+def _check_phase_stepping(config, printer, mcu_stepper):
+    """If a TMC5160 with phase_stepping: true is configured for this
+    stepper, create and register an MCU_phase_stepper object."""
+    stepper_name = config.get_name()
+    # Look for a matching [tmc5160 stepper_x] section
+    tmc_name = 'tmc5160 ' + stepper_name.split()[-1]
+    if not config.has_section(tmc_name):
+        return
+    # Check if phase_stepping is enabled in config (read directly,
+    # tmc_obj doesn't exist yet)
+    tmc_config = config.getsection(tmc_name)
+    if not tmc_config.getboolean('phase_stepping', False):
+        return
+    # Create MCU_phase_stepper NOW so register_config_callback runs
+    # before MCU config phase. tmc_obj is resolved later at connect.
+    from .extras.tmc_phase_stepping import MCU_phase_stepper
+    ps = MCU_phase_stepper(tmc_config, mcu_stepper, tmc_name)
+    logging.info("Phase stepping configured for %s", stepper_name)
+    def _finish_phase_stepper_setup(eventtime=None):
+        tmc_obj = printer.lookup_object(tmc_name, None)
+        if tmc_obj is None:
+            return
+        ps.set_tmc_obj(tmc_obj)
+        tmc_ps = printer.load_object(tmc_config, 'tmc_phase_stepping')
+        tmc_ps.register_phase_stepper(stepper_name, ps)
+    printer.register_event_handler('klippy:connect',
+                                   _finish_phase_stepper_setup)
 
 
 # Parse stepper gear_ratio config parameter
