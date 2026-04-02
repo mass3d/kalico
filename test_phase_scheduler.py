@@ -159,6 +159,20 @@ class BufferedMotionResumeState:
 
 
 @dataclass
+class ExactOidResponseRouter:
+    handlers: dict
+
+    def __init__(self):
+        self.handlers = {}
+
+    def register(self, name, oid=None):
+        self.handlers[name, oid] = True
+
+    def deliver(self, name, oid=None):
+        return self.handlers.get((name, oid), False)
+
+
+@dataclass
 class IdleEntryState:
     mcu_hold_active: bool = False
     needs_clock_reset: bool = True
@@ -331,6 +345,10 @@ def retry_resume_start(flush_time, resume_lookback):
     return max(0.0, flush_time - resume_lookback)
 
 
+def recent_idle_tail_start(flush_time, idle_lookback, resume_lookback):
+    return max(0.0, flush_time - max(idle_lookback, resume_lookback))
+
+
 def sample_positions(last_flush_time, flush_time, interval, max_samples,
                      hold_position, move_start, velocity):
     positions = []
@@ -340,6 +358,24 @@ def sample_positions(last_flush_time, flush_time, interval, max_samples,
             pos = hold_position
         else:
             pos = hold_position + (t - move_start) * velocity
+        positions.append(pos)
+        t += interval
+    return positions
+
+
+def sample_piecewise_positions(last_flush_time, flush_time, interval,
+                               max_samples, hold_position,
+                               move_start, move_end, end_position):
+    positions = []
+    t = last_flush_time
+    velocity = ((end_position - hold_position) / (move_end - move_start))
+    while t < flush_time and len(positions) < max_samples:
+        if t < move_start:
+            pos = hold_position
+        elif t < move_end:
+            pos = hold_position + (t - move_start) * velocity
+        else:
+            pos = end_position
         positions.append(pos)
         t += interval
     return positions
@@ -469,6 +505,36 @@ def test_resume_retry_rewinds_to_recent_idle_history():
           " idle history instead of synthesizing a bad anchor")
 
 
+def test_long_idle_flush_rechecks_recent_tail_before_declaring_standstill():
+    interval = 0.1
+    max_samples = 32
+    flush_time = 150.567
+    old_start = 136.805
+    hold_position = -209436.993
+    end_position = 33762.993
+    move_start = 149.000
+    move_end = 149.500
+
+    head_only = sample_piecewise_positions(
+        last_flush_time=old_start, flush_time=flush_time,
+        interval=interval, max_samples=max_samples,
+        hold_position=hold_position, move_start=move_start,
+        move_end=move_end, end_position=end_position)
+    tail_start = recent_idle_tail_start(
+        flush_time, idle_lookback=0.5, resume_lookback=2.0)
+    recent_tail = sample_piecewise_positions(
+        last_flush_time=tail_start, flush_time=flush_time,
+        interval=interval, max_samples=max_samples,
+        hold_position=hold_position, move_start=move_start,
+        move_end=move_end, end_position=end_position)
+
+    assert all(abs(pos - hold_position) < 0.5 for pos in head_only), head_only
+    assert abs(recent_tail[-1] - end_position) < 0.5, recent_tail[-5:]
+    assert abs(recent_tail[0] - hold_position) < 0.5, recent_tail[:5]
+    print("PASS: long idle standstill flushes recheck the recent tail so a"
+          " completed move is not skipped")
+
+
 def test_natural_idle_does_not_need_host_hold_padding():
     host = HostResetState(needs_clock_reset=True, expected_end_clock=0)
     mcu = ContinuousIdleMCUMotor()
@@ -519,6 +585,20 @@ def test_natural_idle_keeps_mcu_hold_active_without_reset():
     assert not need_reset
     assert mcu.queue_batch()
     print("PASS: natural idle keeps the MCU hold active without a reset")
+
+
+def test_query_response_router_requires_exact_oid_match():
+    router = ExactOidResponseRouter()
+
+    router.register("phase_stepper_status")
+    assert not router.deliver("phase_stepper_status", oid=17), \
+        "a query handler registered without oid will miss oid-tagged replies"
+
+    router = ExactOidResponseRouter()
+    router.register("phase_stepper_status", oid=17)
+    assert router.deliver("phase_stepper_status", oid=17), \
+        "registering the handler with the phase stepper oid matches the reply"
+    print("PASS: MCU query handlers must register with the exact oid")
 
 
 def test_explicit_idle_boundary_requires_new_clock_anchor():
@@ -779,9 +859,11 @@ def main():
         test_resume_keeps_one_held_phase_sample,
         test_natural_idle_flush_preserves_held_phase_on_resume,
         test_resume_retry_rewinds_to_recent_idle_history,
+        test_long_idle_flush_rechecks_recent_tail_before_declaring_standstill,
         test_natural_idle_does_not_need_host_hold_padding,
         test_pre_move_idle_keeps_clock_reset_armed,
         test_natural_idle_keeps_mcu_hold_active_without_reset,
+        test_query_response_router_requires_exact_oid_match,
         test_explicit_idle_boundary_requires_new_clock_anchor,
         test_idle_boundary_forces_reset_before_resume,
         test_diagnostic_boundary_forces_reset_before_resume,
