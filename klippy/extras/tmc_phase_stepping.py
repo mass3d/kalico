@@ -161,7 +161,8 @@ class MCU_phase_stepper:
         self._status_cmd = self.mcu.lookup_query_command(
             "get_phase_stepper_status oid=%c",
             "phase_stepper_status oid=%c event_count=%u write_count=%u"
-            " skip_count=%u last_phase=%hu position=%i")
+            " skip_count=%u last_phase=%hu position=%i",
+            oid=self.oid)
     def get_mcu_status(self):
         """Query MCU-side ISR diagnostic counters."""
         if self._status_cmd is None:
@@ -353,6 +354,15 @@ class MCU_phase_stepper:
     def _clear_idle_state(self):
         self._idle_position = None
         self._idle_start_time = None
+    def _recent_history_start(self, flush_time):
+        history = max(self.idle_lookback, self.resume_lookback)
+        if history <= 0.0:
+            return flush_time
+        return max(0.0, flush_time - history)
+    def _sampled_until(self, num_samples):
+        if num_samples <= 0:
+            return 0.0
+        return self._samples[num_samples - 1].time + self.update_interval
     def _set_idle_boundary(self, flush_time, label='boundary'):
         lookback = min(self.idle_lookback, flush_time)
         boundary_time = flush_time - lookback
@@ -531,8 +541,45 @@ class MCU_phase_stepper:
             return
         self._invalid_flush_count = 0
         if abs(last_pos - first_pos) < 0.5:
-            self._enter_idle_hold(flush_time, first_pos, 'standstill')
-            return
+            sampled_until = self._sampled_until(num_samples)
+            # A long idle gap can overflow the sample buffer. If we only
+            # inspect the oldest idle window and then jump straight to
+            # flush_time, we can skip an entire move that happened in the
+            # recent tail of that gap. Re-sample the most recent idle history
+            # window before declaring this flush pure standstill.
+            tail_start = self._recent_history_start(flush_time)
+            if (sampled_until + self.update_interval * 0.5 < flush_time
+                    and tail_start > self._samples[0].time
+                    + self.update_interval * 0.5):
+                self._trace_event('retry_idle_tail', flush=flush_time,
+                                  old_start=self._samples[0].time,
+                                  new_start=tail_start)
+                logging.info(
+                    "phase_gen %s: retrying recent idle tail"
+                    " old_start=%.3f new_start=%.3f flush=%.3f",
+                    self.name, self._samples[0].time,
+                    tail_start, flush_time)
+                ffi_lib.phase_generator_set_time(
+                    self._phase_generator, tail_start)
+                num_samples = self._generate_samples(ffi_lib, flush_time)
+                if num_samples <= 0:
+                    return
+                ret = ffi_lib.phase_generator_extract_positions(
+                    self._samples, num_samples, self._positions)
+                first_pos = self._samples[0].position
+                last_pos = self._samples[num_samples - 1].position
+                if ret < 0:
+                    boundary_time = self._set_idle_boundary(
+                        flush_time, label='retry-idle-invalid-samples')
+                    logging.info(
+                        "phase_gen %s: invalid samples after idle-tail retry"
+                        " at flush=%.3f (holding %.3fs lookback to %.3f)",
+                        self.name, flush_time,
+                        flush_time - boundary_time, boundary_time)
+                    return
+            if abs(last_pos - first_pos) < 0.5:
+                self._enter_idle_hold(flush_time, first_pos, 'standstill')
+                return
         resuming_from_idle = self._idle_position is not None
         move_start = None
         trim_start = None
