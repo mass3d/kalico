@@ -1,8 +1,8 @@
-// Timer-driven SPI phase stepper for TMC5160 XDIRECT mode
+// Group-ISR phase stepper for TMC5160 XDIRECT mode
 //
-// Each phase-stepped motor keeps its own absolute due time, matching the
-// step/dir model in stepper.c. Motors share the MCU clock, but they do not
-// inherit another motor's cadence just because it is already active.
+// A single timer processes all registered phase steppers on each tick,
+// eliminating per-motor timer overhead and SPI bus contention. Each
+// motor retains its own move queue, position polynomial, and counters.
 //
 // Copyright (C) 2026  klipper contributors
 //
@@ -11,6 +11,7 @@
 #include <string.h> // memset
 #include "autoconf.h" // CONFIG_*
 #include "basecmd.h" // oid_alloc
+#include "board/gpio.h" // gpio_out_write
 #include "board/irq.h" // irq_disable
 #include "board/misc.h" // timer_read_time
 #include "command.h" // DECL_COMMAND
@@ -83,11 +84,12 @@ struct phase_move {
 // Driver output mode
 enum { PM_MODE_DIRECT_CURRENT = 0, PM_MODE_POSITION_TARGET = 1 };
 
+enum { PSF_NEED_RESET = 1<<0, PSF_IDLE_HOLD = 1<<1 };
+
 struct tmc_phase_stepper {
-    struct timer timer;
     struct spidev_s *spi;
     struct move_queue_head mq;
-    uint32_t interval;          // Ticks between SPI writes
+    uint32_t interval;          // Ticks between SPI writes (for queue compat)
     int32_t position;           // Current microstep position (16.16 fixed-point)
     int32_t last_emitted_position; // Last phase position actually written
     int32_t velocity;           // Current velocity per interval (16.16)
@@ -96,6 +98,7 @@ struct tmc_phase_stepper {
     uint8_t mode;               // PM_MODE_DIRECT_CURRENT or PM_MODE_POSITION_TARGET
     uint16_t current_scale;     // Run current scaling factor (0..248)
     uint8_t flags;
+    uint8_t group_index;        // Index in group_isr.motors[]
     struct trsync_signal stop_signal;
     // Diagnostic counters
     uint32_t event_count;       // Total ISR events processed
@@ -104,7 +107,17 @@ struct tmc_phase_stepper {
     uint16_t last_phase;        // Last phase value written
 };
 
-enum { PSF_NEED_RESET = 1<<0, PSF_IDLE_HOLD = 1<<1 };
+// Group ISR singleton -- single timer manages all phase steppers
+#define MAX_GROUP_MOTORS 6
+
+static struct {
+    struct timer timer;
+    uint32_t interval;              // Ticks between group ticks
+    struct tmc_phase_stepper *motors[MAX_GROUP_MOTORS];
+    uint8_t motor_count;            // Number of registered motors
+    uint8_t active;                 // Group timer is running
+    uint32_t group_tick_count;      // Total group ticks
+} group_isr;
 
 // Load next phase_move segment from the queue
 static uint_fast8_t
@@ -134,56 +147,92 @@ phase_stepper_load_next(struct tmc_phase_stepper *ps)
     return SF_RESCHEDULE;
 }
 
-// Timer event: evaluate position and write SPI.
-// The write-first order ensures the first tick outputs start_position
-// (not start + velocity), preventing cumulative drift at move boundaries.
-static uint_fast8_t
-phase_stepper_event(struct timer *t)
+// Helper: check if all motors are fully stopped (PSF_NEED_RESET)
+static uint8_t
+all_motors_stopped(void)
 {
-    struct tmc_phase_stepper *ps = container_of(
-        t, struct tmc_phase_stepper, timer);
-    int32_t emitted_position = ps->position;
+    for (uint8_t i = 0; i < group_isr.motor_count; i++) {
+        struct tmc_phase_stepper *m = group_isr.motors[i];
+        if (m && !(m->flags & PSF_NEED_RESET))
+            return 0;
+    }
+    return 1;
+}
 
-    ps->event_count++;
+// Helper: stop the group timer if all motors are stopped
+static void
+maybe_stop_group_timer(void)
+{
+    if (group_isr.active && all_motors_stopped()) {
+        sched_del_timer(&group_isr.timer);
+        group_isr.active = 0;
+    }
+}
 
-    // Write coil currents via SPI FIRST, using current position.
-    if (!spidev_is_bus_busy()) {
+// Group timer event: process all motors in a single ISR tick.
+// Uses spidev_transfer() for each motor — same SPI path as the
+// original per-motor ISR, just called sequentially from one timer.
+static uint_fast8_t
+group_phase_stepper_event(struct timer *t)
+{
+    group_isr.group_tick_count++;
+
+    uint8_t any_active = 0;
+    uint8_t n = group_isr.motor_count;
+    for (uint8_t i = 0; i < n; i++) {
+        struct tmc_phase_stepper *ps = group_isr.motors[i];
+        if (!ps || ps->count == 0)
+            continue;
+        any_active = 1;
+        ps->event_count++;
+
+        // Compute phase from current position
+        int32_t emitted_position = ps->position;
         uint16_t phase = (uint16_t)((ps->position >> 16) & 0x3FF);
 
         if (ps->mode == PM_MODE_DIRECT_CURRENT) {
-            // TMC5160 MSCNT tracks phase B on the sine wave and phase A on the
-            // cosine wave. XTARGET uses A in bits 8..0 and B in bits 24..16.
-            int16_t cur_a = (phase_cos(phase)
-                             * (int16_t)ps->current_scale) >> 8;
-            int16_t cur_b = (phase_sin(phase)
-                             * (int16_t)ps->current_scale) >> 8;
-            uint16_t ua = (uint16_t)cur_a & 0x1FF;
-            uint16_t ub = (uint16_t)cur_b & 0x1FF;
-            uint8_t msg[5];
-            msg[0] = 0x2D | 0x80;
-            msg[1] = (uint8_t)(ub >> 8);
-            msg[2] = (uint8_t)(ub);
-            msg[3] = (uint8_t)(ua >> 8);
-            msg[4] = (uint8_t)(ua);
-            spidev_transfer(ps->spi, 0, sizeof(msg), msg);
-            ps->write_count++;
-            ps->last_phase = phase;
+            // Write coil currents via SPI — same path as original ISR
+            if (!spidev_is_bus_busy()) {
+                int16_t cur_a = (phase_cos(phase)
+                                 * (int16_t)ps->current_scale) >> 8;
+                int16_t cur_b = (phase_sin(phase)
+                                 * (int16_t)ps->current_scale) >> 8;
+                uint16_t ua = (uint16_t)cur_a & 0x1FF;
+                uint16_t ub = (uint16_t)cur_b & 0x1FF;
+                uint8_t msg[5];
+                msg[0] = 0x2D | 0x80;
+                msg[1] = (uint8_t)(ub >> 8);
+                msg[2] = (uint8_t)(ub);
+                msg[3] = (uint8_t)(ua >> 8);
+                msg[4] = (uint8_t)(ua);
+
+                spidev_transfer(ps->spi, 0, sizeof(msg), msg);
+                ps->write_count++;
+                ps->last_phase = phase;
+            } else {
+                ps->skip_count++;
+            }
         }
-    } else {
-        ps->skip_count++;
-    }
-    ps->last_emitted_position = emitted_position;
+        ps->last_emitted_position = emitted_position;
 
-    // Advance position polynomial AFTER SPI write
-    ps->position += ps->velocity;
-    ps->velocity += ps->acceleration;
+        // Advance position polynomial AFTER SPI write
+        ps->position += ps->velocity;
+        ps->velocity += ps->acceleration;
 
-    // Segment management
-    ps->timer.waketime += ps->interval;
-    if (--ps->count == 0) {
-        ps->position = emitted_position;
-        return phase_stepper_load_next(ps);
+        // Segment management
+        if (--ps->count == 0) {
+            ps->position = emitted_position;
+            phase_stepper_load_next(ps);
+        }
     }
+
+    // Stop group timer if all motors are fully stopped
+    if (!any_active && all_motors_stopped()) {
+        group_isr.active = 0;
+        return SF_DONE;
+    }
+
+    group_isr.timer.waketime += group_isr.interval;
     return SF_RESCHEDULE;
 }
 
@@ -195,10 +244,20 @@ command_config_tmc_phase_stepper(uint32_t *args)
         args[0], command_config_tmc_phase_stepper, sizeof(*ps));
     ps->spi = spidev_oid_lookup(args[1]);
     ps->mode = args[2];
-    ps->timer.func = phase_stepper_event;
     ps->current_scale = 256; // 256 = no additional scaling (output = table value)
     ps->last_emitted_position = 0;
     move_queue_setup(&ps->mq, sizeof(struct phase_move));
+
+    // Register in group ISR
+    uint8_t idx = group_isr.motor_count;
+    if (idx >= MAX_GROUP_MOTORS)
+        shutdown("Too many phase steppers");
+    group_isr.motors[idx] = ps;
+    ps->group_index = idx;
+    group_isr.motor_count = idx + 1;
+
+    if (idx == 0)
+        group_isr.timer.func = group_phase_stepper_event;
 }
 DECL_COMMAND(command_config_tmc_phase_stepper,
              "config_tmc_phase_stepper oid=%c spi_oid=%c mode=%c");
@@ -248,12 +307,17 @@ command_queue_phase_move(uint32_t *args)
         ps->acceleration = pm->acceleration;
         ps->count = pm->count;
         move_free(pm);
-        // Ensure waketime is safely in the future (it may be stale
-        // if the queue drained and time has passed since last event)
-        uint32_t now = timer_read_time();
-        if ((int32_t)(ps->timer.waketime - now) < (int32_t)interval)
-            ps->timer.waketime = now + interval;
-        sched_add_timer(&ps->timer);
+        // Start group timer if not already running
+        if (!group_isr.active) {
+            group_isr.interval = interval;
+            // Preserve waketime from reset_phase_clock if still valid
+            uint32_t now = timer_read_time();
+            if ((int32_t)(group_isr.timer.waketime - now)
+                    < (int32_t)interval)
+                group_isr.timer.waketime = now + interval;
+            sched_add_timer(&group_isr.timer);
+            group_isr.active = 1;
+        }
     }
     irq_enable();
 }
@@ -269,22 +333,22 @@ command_stop_phase_stepper(uint32_t *args)
     struct tmc_phase_stepper *ps = oid_lookup(
         oid, command_config_tmc_phase_stepper);
     irq_disable();
-    sched_del_timer(&ps->timer);
     ps->count = 0;
     ps->velocity = 0;
     ps->acceleration = 0;
     ps->flags = PSF_NEED_RESET;
-    irq_enable();
-    // Leave XDIRECT at its last held value — the host will restore
-    // GCONF (clearing direct_mode) which returns the TMC to normal
-    // step/dir with its own current regulation. Zeroing coil currents
-    // here causes an audible click from the momentary torque loss.
     // Flush move queue
     while (!move_queue_empty(&ps->mq)) {
         struct move_node *mn = move_queue_pop(&ps->mq);
         struct phase_move *pm = container_of(mn, struct phase_move, node);
         move_free(pm);
     }
+    // Leave XDIRECT at its last held value — the host will restore
+    // GCONF (clearing direct_mode) which returns the TMC to normal
+    // step/dir with its own current regulation. Zeroing coil currents
+    // here causes an audible click from the momentary torque loss.
+    maybe_stop_group_timer();
+    irq_enable();
 }
 DECL_COMMAND(command_stop_phase_stepper, "stop_phase_stepper oid=%c");
 
@@ -297,22 +361,21 @@ command_reset_phase_clock(uint32_t *args)
         oid, command_config_tmc_phase_stepper);
     uint32_t waketime = args[1];
     irq_disable();
-    if (ps->count) {
-        sched_del_timer(&ps->timer);
-        ps->count = 0;
-    }
+    ps->count = 0;
     ps->velocity = 0;
     ps->acceleration = 0;
-    ps->count = 0;
     // Flush any queued moves
     while (!move_queue_empty(&ps->mq)) {
         struct move_node *mn = move_queue_pop(&ps->mq);
         struct phase_move *pm = container_of(mn, struct phase_move, node);
         move_free(pm);
     }
-    // Store waketime for queue_phase_move to use when starting the timer
-    ps->timer.waketime = waketime;
-    ps->flags = 0;  // Clear all flags (ACTIVE, NEED_RESET)
+    // Set group timer waketime if not already running -- this anchors
+    // the clock for subsequent queue_phase_move calls
+    if (!group_isr.active) {
+        group_isr.timer.waketime = waketime;
+    }
+    ps->flags = 0;  // Clear all flags (NEED_RESET, IDLE_HOLD)
     irq_enable();
 }
 DECL_COMMAND(command_reset_phase_clock,
@@ -345,7 +408,6 @@ phase_stepper_stop(struct trsync_signal *tss, uint8_t reason)
 {
     struct tmc_phase_stepper *ps = container_of(
         tss, struct tmc_phase_stepper, stop_signal);
-    sched_del_timer(&ps->timer);
     ps->count = 0;
     ps->velocity = 0;
     ps->acceleration = 0;
@@ -356,6 +418,7 @@ phase_stepper_stop(struct trsync_signal *tss, uint8_t reason)
         struct phase_move *pm = container_of(mn, struct phase_move, node);
         move_free(pm);
     }
+    maybe_stop_group_timer();
 }
 
 // MCU command: tmc_phase_stepper_stop_on_trigger oid=%c trsync_oid=%c
@@ -375,11 +438,18 @@ DECL_COMMAND(command_tmc_phase_stepper_stop_on_trigger,
 void
 tmc_phase_stepper_shutdown(void)
 {
+    if (group_isr.active) {
+        sched_del_timer(&group_isr.timer);
+        group_isr.active = 0;
+    }
     uint8_t i;
     struct tmc_phase_stepper *ps;
     foreach_oid(i, ps, command_config_tmc_phase_stepper) {
         move_queue_clear(&ps->mq);
-        phase_stepper_stop(&ps->stop_signal, 0);
+        ps->count = 0;
+        ps->velocity = 0;
+        ps->acceleration = 0;
+        ps->flags = PSF_NEED_RESET;
     }
 }
 DECL_SHUTDOWN(tmc_phase_stepper_shutdown);

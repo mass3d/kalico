@@ -101,6 +101,18 @@ spidev_get_cs_pin(struct spidev_s *spi)
     return spi->pin;
 }
 
+struct spi_config
+spidev_get_spi_config(struct spidev_s *spi)
+{
+    return spi->spi_config;
+}
+
+uint8_t
+spidev_is_cs_active_high(struct spidev_s *spi)
+{
+    return !!(spi->flags & SF_CS_ACTIVE_HIGH);
+}
+
 // SPI bus busy flag for ISR contention avoidance
 static volatile uint8_t spi_bus_busy;
 // SPI bus hold flag — keeps ISR from writing between multi-transaction sequences
@@ -110,6 +122,12 @@ uint8_t
 spidev_is_bus_busy(void)
 {
     return spi_bus_busy || spi_bus_hold;
+}
+
+void
+spidev_set_bus_busy(uint8_t busy)
+{
+    spi_bus_busy = busy;
 }
 
 void
