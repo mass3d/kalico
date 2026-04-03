@@ -110,6 +110,11 @@ class MCU_SPI:
         self.spi_send_cmd = self.mcu.lookup_command(
             "spi_send oid=%c data=%*s", cq=self.cmd_queue
         )
+        self.spi_send_hold_cmd = self.mcu.try_lookup_command(
+            "spi_send_hold oid=%c data=%*s")
+        if self.spi_send_hold_cmd is not None:
+            self.spi_send_hold_cmd = self.mcu.lookup_command(
+                "spi_send_hold oid=%c data=%*s", cq=self.cmd_queue)
         self.spi_transfer_cmd = self.mcu.lookup_query_command(
             "spi_transfer oid=%c data=%*s",
             "spi_transfer_response oid=%c response=%*s",
@@ -139,6 +144,22 @@ class MCU_SPI:
     ):
         return self.spi_transfer_cmd.send_with_preface(
             self.spi_send_cmd,
+            [self.oid, preface_data],
+            [self.oid, data],
+            minclock=minclock,
+            reqclock=reqclock,
+        )
+
+    def spi_transfer_with_hold(
+        self, preface_data, data, minclock=0, reqclock=0
+    ):
+        # Like spi_transfer_with_preface but uses spi_send_hold as preface.
+        # This holds the SPI bus between the send and transfer, preventing
+        # ISR SPI writes from slipping between the two transactions.
+        # Falls back to regular preface if MCU firmware lacks spi_send_hold.
+        preface_cmd = self.spi_send_hold_cmd or self.spi_send_cmd
+        return self.spi_transfer_cmd.send_with_preface(
+            preface_cmd,
             [self.oid, preface_data],
             [self.oid, data],
             minclock=minclock,

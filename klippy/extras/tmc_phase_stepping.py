@@ -212,7 +212,7 @@ class MCU_phase_stepper:
         if self._phase_direction_override:
             direction = 1.0 if self._phase_direction_override > 0 else -1.0
             return direction, 'override'
-        direction = -1.0 if invert_dir else 1.0
+        direction = 1.0 if invert_dir else -1.0
         return direction, 'invert_dir'
     def _phase_vector_from_position(self, phase_position):
         phase = _phase_position_to_mcu_phase(phase_position)
@@ -501,10 +501,10 @@ class MCU_phase_stepper:
         self._idle_start_time = flush_time
         self._last_commanded_position = self._phase_to_commanded(phase_position)
         self._expected_end_clock = 0
-        # Natural idle is continuous only after at least one MCU phase batch has
-        # actually run. Immediately after activation we may have only preloaded
-        # XDIRECT with no timer running yet, so the first real move still needs
-        # a reset_phase_clock anchor.
+        # Natural idle is continuous only after at least one MCU phase batch
+        # has actually run. Immediately after activation we may have only
+        # preloaded XDIRECT with no timer running yet, so the first real
+        # move still needs a reset_phase_clock anchor.
         self._needs_clock_reset = not self._mcu_hold_active
         self._ffi_lib.phase_generator_set_time(
             self._phase_generator, flush_time)
@@ -761,6 +761,12 @@ class MCU_phase_stepper:
         if resuming_from_idle:
             self._had_zero_samples = False
             self._move_log_count = 0
+            # Force a clock reset so all motors on the same MCU start
+            # their first post-idle move at the same clock tick. Without
+            # this, each motor's ISR picks up queued moves independently,
+            # causing milliseconds of desync on CoreXY/AWD where belt
+            # partners must start simultaneously.
+            self._needs_clock_reset = True
             self._trace_event('resume', flush=flush_time, trim=trim_start,
                               move_start=move_start, first=first_pos,
                               last=last_pos, retried=retried_resume)
@@ -872,27 +878,12 @@ class TMCPhaseStepping:
         self.reactor = self.printer.get_reactor()
         self.name = config.get_name()
         self.phase_steppers = {}
-        self.resume_delay = config.getfloat('phase_resume_delay', 1.0,
-                                            minval=0.0)
-        self._resume_generation = 0
-        self._resume_scheduled_generation = 0
-        self._home_rails_depth = 0
-        self._homing_move_depth = 0
         self._phase_stepping_enabled = False
-        self._probe_resume_deferred = False
         self._fault_pending = False
-        self._resume_timer = self.reactor.register_timer(
-            self._resume_event, self.reactor.NEVER)
         self.printer.register_event_handler('klippy:ready',
                                             self._handle_ready)
         self.printer.register_event_handler(
             'homing:homing_move_begin', self._handle_homing_move_begin)
-        self.printer.register_event_handler(
-            'homing:homing_move_end', self._handle_homing_move_end)
-        self.printer.register_event_handler(
-            'homing:home_rails_begin', self._handle_home_rails_begin)
-        self.printer.register_event_handler(
-            'homing:home_rails_end', self._handle_home_rails_end)
         gcode = self.printer.lookup_object('gcode')
         gcode.register_command('PHASE_STEPPER_DEBUG', self.cmd_DEBUG,
                                desc="Query non-disruptive phase stepper state")
@@ -920,7 +911,6 @@ class TMCPhaseStepping:
     def _handle_ready(self):
         pass  # Don't activate at boot — wait for first homing cycle
     def _deactivate_all(self, reason, flush_toolhead=False):
-        self._cancel_resume(reason)
         if not self._phase_stepping_enabled:
             return
         toolhead = self.printer.lookup_object("toolhead")
@@ -934,13 +924,6 @@ class TMCPhaseStepping:
         for name, ps in self.phase_steppers.items():
             ps.deactivate(print_time)
         self._phase_stepping_enabled = False
-    def _has_external_probe_flow(self):
-        for obj_name, _obj in self.printer.lookup_objects():
-            if obj_name == "beacon" or obj_name.startswith("beacon "):
-                return True
-            if obj_name == "beacons" or obj_name.startswith("beacons "):
-                return True
-        return False
     def _handle_phase_fault(self, name, reason):
         if self._fault_pending:
             return
@@ -950,92 +933,11 @@ class TMCPhaseStepping:
             self._deactivate_all("phase fault: %s (%s)" % (name, reason),
                                  flush_toolhead=True)
         self.reactor.register_callback(do_fault)
-    def _cancel_resume(self, reason):
-        self._resume_generation += 1
-        self._resume_scheduled_generation = 0
-        self.reactor.update_timer(self._resume_timer, self.reactor.NEVER)
-        logging.info("Phase stepping resume canceled: %s", reason)
-    def _schedule_resume(self, reason, delay=None):
-        if delay is None:
-            delay = self.resume_delay
-        self._resume_generation += 1
-        self._resume_scheduled_generation = self._resume_generation
-        self._probe_resume_deferred = False
-        waketime = self.reactor.monotonic() + delay
-        self.reactor.update_timer(self._resume_timer, waketime)
-        logging.info("Phase stepping resume scheduled in %.3fs: %s",
-                     delay, reason)
-    def _is_probe_busy(self):
-        probe = self.printer.lookup_object("probe", None)
-        if probe is None:
-            return False
-        return bool(getattr(probe, "multi_probe_pending", False))
-    def _buffered_motion_time(self):
-        toolhead = self.printer.lookup_object("toolhead")
-        if getattr(toolhead, "special_queuing_state", ""):
-            return 0.0
-        eventtime = self.reactor.monotonic()
-        print_time, est_print_time, _lookahead_empty = toolhead.check_busy(
-            eventtime)
-        return print_time - est_print_time
-    def _resume_event(self, eventtime):
-        scheduled_generation = self._resume_scheduled_generation
-        if not scheduled_generation:
-            return self.reactor.NEVER
-        if scheduled_generation != self._resume_generation:
-            self._resume_scheduled_generation = 0
-            return self.reactor.NEVER
-        if self._home_rails_depth or self._homing_move_depth:
-            logging.info("Phase stepping resume deferred:"
-                         " home_rails_depth=%d homing_move_depth=%d",
-                         self._home_rails_depth, self._homing_move_depth)
-            self._probe_resume_deferred = False
-            return eventtime + 0.250
-        if self._is_probe_busy():
-            if not self._probe_resume_deferred:
-                logging.info("Phase stepping resume deferred:"
-                             " probe multi_probe still active")
-                self._probe_resume_deferred = True
-            return eventtime + 0.250
-        buffered_motion = self._buffered_motion_time()
-        if buffered_motion > 0.050:
-            logging.info("Phase stepping resume deferred:"
-                         " %.3fs of motion still buffered",
-                         buffered_motion)
-            return eventtime + min(0.250, buffered_motion)
-        self._resume_scheduled_generation = 0
-        self._probe_resume_deferred = False
-        logging.info("Phase stepping resume fired")
-        self._activate_all()
-        return self.reactor.NEVER
     def _handle_homing_move_begin(self, hmove):
-        self._homing_move_depth += 1
-        self._deactivate_all("homing_move_begin")
-    def _handle_homing_move_end(self, hmove):
-        if self._homing_move_depth:
-            self._homing_move_depth -= 1
-        if self._home_rails_depth or self._homing_move_depth:
-            return
-        if self._has_external_probe_flow():
-            logging.info("Phase stepping auto-resume suppressed:"
-                         " external Beacon/probe flow present")
-            return
-        self._schedule_resume("homing_move_end")
-    def _handle_home_rails_begin(self, homing_state, rails):
-        self._home_rails_depth += 1
-        self._deactivate_all("home_rails_begin")
-    def _handle_home_rails_end(self, homing_state, rails):
-        if self._home_rails_depth:
-            self._home_rails_depth -= 1
-        if self._home_rails_depth or self._homing_move_depth:
-            return
-        if self._has_external_probe_flow():
-            logging.info("Phase stepping auto-resume suppressed:"
-                         " external Beacon/probe flow present")
-            return
-        # Beacon and other probe flows can continue after home_rails_end.
-        # Delay reactivation and allow a new homing/probe begin to cancel it.
-        self._schedule_resume("home_rails_end")
+        if self._phase_stepping_enabled:
+            raise self.printer.command_error(
+                "Cannot home while phase stepping is active."
+                " Run PHASE_STEPPER_SUSPEND first.")
     def _tmc_debug_state(self, ps, live=False):
         if ps.tmc_obj is None:
             return {}
@@ -1175,19 +1077,11 @@ class TMCPhaseStepping:
             return
         names = ([motor_filter] if motor_filter
                  else sorted(self.phase_steppers.keys()))
-        gcmd.respond_info("phase_resume_pending=%s phase_resume_delay=%.3f"
-                          " mcu_query=%s tmc_query=%s home_rails_depth=%d"
-                          " homing_move_depth=%d probe_pending=%s"
-                          " buffered_motion=%.3f"
-                          " beacon_present=%s"
-                          % (bool(self._resume_scheduled_generation),
-                             self.resume_delay, bool(query_mcu),
-                             bool(query_tmc),
-                             self._home_rails_depth,
-                             self._homing_move_depth,
-                             self._is_probe_busy(),
-                             max(0.0, self._buffered_motion_time()),
-                             self._has_external_probe_flow()))
+        gcmd.respond_info("phase_stepping_enabled=%s"
+                          " mcu_query=%s tmc_query=%s"
+                          % (self._phase_stepping_enabled,
+                             bool(query_mcu),
+                             bool(query_tmc)))
         for name in names:
             ps = self.phase_steppers[name]
             mstat = {}
@@ -1353,21 +1247,7 @@ class TMCPhaseStepping:
             if clear:
                 del ps._trace_events[:]
     def cmd_RESUME(self, gcmd):
-        """PHASE_STEPPER_RESUME - re-enable phase stepping.
-        DELAY=<seconds> optionally defers activation."""
-        delay = gcmd.get_float("DELAY", 0.0, minval=0.0)
-        if delay > 0.0:
-            self._schedule_resume("gcode resume", delay)
-            gcmd.respond_info("Phase stepping resume scheduled in %.3fs"
-                              % (delay,))
-            return
-        buffered_motion = self._buffered_motion_time()
-        if buffered_motion > 0.050:
-            self._schedule_resume("gcode resume waiting for idle", 0.0)
-            gcmd.respond_info("Phase stepping resume deferred until motion is"
-                              " idle")
-            return
-        self._cancel_resume("gcode resume immediate")
+        """PHASE_STEPPER_RESUME - re-enable phase stepping."""
         self._activate_all()
         gcmd.respond_info("Phase stepping resumed")
     def cmd_SET_DIRECTION(self, gcmd):

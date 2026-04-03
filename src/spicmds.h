@@ -10,5 +10,6 @@ int spidev_have_cs_pin(struct spidev_s *spi);
 struct gpio_out spidev_get_cs_pin(struct spidev_s *spi);
 void spidev_transfer(struct spidev_s *spi, uint8_t receive_data
                      , uint8_t data_len, uint8_t *data);
+uint8_t spidev_is_bus_busy(void);
 
 #endif // spicmds.h

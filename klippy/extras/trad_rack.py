@@ -2360,6 +2360,7 @@ class TradRackToolHead(toolhead.ToolHead, object):
         self.square_corner_velocity = config.getfloat(
             "square_corner_velocity", 5.0, minval=0.0
         )
+        self.max_jerk = 0.
         self.junction_deviation = self.max_accel_to_decel = 0.0
         self._calc_junction_deviation()
         # Input stall detection
@@ -2391,6 +2392,7 @@ class TradRackToolHead(toolhead.ToolHead, object):
         ffi_main, ffi_lib = chelper.get_ffi()
         self.trapq = ffi_main.gc(ffi_lib.trapq_alloc(), ffi_lib.trapq_free)
         self.trapq_append = ffi_lib.trapq_append
+        self.trapq_append_scurve = ffi_lib.trapq_append_scurve
         self.trapq_finalize_moves = ffi_lib.trapq_finalize_moves
         self.step_generators = []
         # Create kinematic class
