@@ -144,6 +144,18 @@ class ProbeAwareResumeState:
 
 
 @dataclass
+class HomingDeferredResumeState:
+    resume: DelayedResumeState
+    home_rails_depth: int = 0
+    homing_move_depth: int = 0
+
+    def fire(self, generation):
+        if self.home_rails_depth or self.homing_move_depth:
+            return "retry"
+        return self.resume.fire(generation)
+
+
+@dataclass
 class BufferedMotionResumeState:
     resume: DelayedResumeState
     buffered_motion: float = 0.0
@@ -209,6 +221,57 @@ def activation_preload(mscnt, live_cur_a, live_cur_b):
     return (int(round(248.0 * math.cos(angle))),
             int(round(248.0 * math.sin(angle))),
             "mscnt")
+
+
+def phase_from_currents(cur_a, cur_b):
+    if not cur_a and not cur_b:
+        return None
+    phase = int(round(math.atan2(cur_b, cur_a)
+                      * 1024.0 / (2.0 * math.pi)))
+    return phase & 0x3FF
+
+
+def phase_delta(from_phase, to_phase):
+    if from_phase is None or to_phase is None:
+        return None
+    delta = (to_phase - from_phase) & 0x3FF
+    if delta >= 0x200:
+        delta -= 0x400
+    return delta
+
+
+def phase_position_to_mcu_phase(position):
+    reduced = math.fmod(position, 1024.0)
+    fixed = int(reduced * 65536.0)
+    return (fixed >> 16) & 0x3FF
+
+
+def vector_peak_delta(cur_a, cur_b, next_a, next_b):
+    return max(abs(cur_a - next_a), abs(cur_b - next_b))
+
+
+def continuity_snapshot(origin, from_phase, to_phase):
+    from_a = int(round(248.0 * math.cos(from_phase * 2.0 * math.pi / 1024.0)))
+    from_b = int(round(248.0 * math.sin(from_phase * 2.0 * math.pi / 1024.0)))
+    to_a = int(round(248.0 * math.cos(to_phase * 2.0 * math.pi / 1024.0)))
+    to_b = int(round(248.0 * math.sin(to_phase * 2.0 * math.pi / 1024.0)))
+    return {
+        "origin": origin,
+        "from_phase": from_phase,
+        "to_phase": to_phase,
+        "delta_phase": phase_delta(from_phase, to_phase),
+        "delta_peak": vector_peak_delta(from_a, from_b, to_a, to_b),
+        "from_a": from_a,
+        "from_b": from_b,
+        "to_a": to_a,
+        "to_b": to_b,
+    }
+
+
+def resolve_phase_direction(invert_dir, override=0):
+    if override:
+        return 1 if override > 0 else -1
+    return -1 if invert_dir else 1
 
 
 def decode_mscuract_5160(raw):
@@ -749,6 +812,21 @@ def test_probe_window_defers_resume_until_calibration_finishes():
     print("PASS: probe multi-probe defers resume until calibration ends")
 
 
+def test_manual_delayed_resume_retries_until_homing_clears():
+    state = HomingDeferredResumeState(
+        resume=DelayedResumeState(), home_rails_depth=1)
+
+    generation = state.resume.schedule()
+    assert state.fire(generation) == "retry", \
+        "manual delayed resume should keep retrying while homing is active"
+    assert state.resume.scheduled_generation == generation
+
+    state.home_rails_depth = 0
+    assert state.fire(generation), \
+        "the same delayed resume should fire once homing clears"
+    print("PASS: manual delayed resume retries until homing completes")
+
+
 def test_buffered_motion_defers_resume_until_printer_is_idle():
     state = BufferedMotionResumeState(
         resume=DelayedResumeState(), buffered_motion=0.8)
@@ -836,6 +914,37 @@ def test_activation_preload_prefers_live_current_vector():
     print("PASS: activation preload prefers the live MSCURACT vector")
 
 
+def test_phase_from_currents_roundtrips_logged_activation_vectors():
+    assert phase_from_currents(16, 246) == 245
+    assert phase_from_currents(-180, 169) == 389
+    assert phase_from_currents(-7, 247) == 261
+    print("PASS: direct-mode phase diagnostics can recover phase from"
+          " logged current vectors")
+
+
+def test_phase_position_to_mcu_phase_matches_fixed_point_wrap():
+    assert phase_position_to_mcu_phase(-30476.790) == 243
+    assert phase_position_to_mcu_phase(-210955.993) == 1012
+    assert phase_position_to_mcu_phase(32243.993) == 499
+    print("PASS: continuity diagnostics use the same wrapped phase as the MCU")
+
+
+def test_continuity_snapshot_sees_small_idle_restart_jump():
+    snap = continuity_snapshot("idle_resume", 1012, 1013)
+    assert snap["delta_phase"] == 1
+    assert snap["delta_peak"] <= 2
+    print("PASS: idle restarts report a one-phase continuity jump when"
+          " the restart is electrically smooth")
+
+
+def test_continuity_snapshot_sees_large_preload_readback_mismatch():
+    snap = continuity_snapshot("activation", 244, 994)
+    assert snap["delta_phase"] == -274
+    assert snap["delta_peak"] > 200
+    print("PASS: activation diagnostics detect a large preload/readback"
+          " phase mismatch")
+
+
 def test_tmc5160_mscuract_decode_matches_datasheet_bit_order():
     raw = ((-5 & 0x1FF) << 16) | (-248 & 0x1FF)
     cur_a, cur_b = decode_mscuract_5160(raw)
@@ -850,6 +959,13 @@ def test_activation_preload_falls_back_to_phase_table():
     assert preload_a == -248
     assert abs(preload_b) <= 2
     print("PASS: activation preload falls back to MSCNT when live current is unavailable")
+
+
+def test_phase_direction_override_beats_invert_dir_auto():
+    assert resolve_phase_direction(True) == -1
+    assert resolve_phase_direction(True, override=1) == 1
+    assert resolve_phase_direction(False, override=-1) == -1
+    print("PASS: explicit phase direction overrides beat invert_dir auto-detection")
 
 
 def main():
@@ -873,6 +989,7 @@ def main():
         test_nested_homing_cancels_early_resume,
         test_only_latest_manual_resume_can_fire,
         test_probe_window_defers_resume_until_calibration_finishes,
+        test_manual_delayed_resume_retries_until_homing_clears,
         test_buffered_motion_defers_resume_until_printer_is_idle,
         test_priming_buffer_does_not_block_resume,
         test_suspend_resyncs_before_stepdir_unmasks,
@@ -881,8 +998,13 @@ def main():
         test_phase_active_policy_keeps_run_current_and_delays_powerdown,
         test_phase_active_policy_does_not_mutate_cached_driver_settings,
         test_activation_preload_prefers_live_current_vector,
+        test_phase_from_currents_roundtrips_logged_activation_vectors,
+        test_phase_position_to_mcu_phase_matches_fixed_point_wrap,
+        test_continuity_snapshot_sees_small_idle_restart_jump,
+        test_continuity_snapshot_sees_large_preload_readback_mismatch,
         test_tmc5160_mscuract_decode_matches_datasheet_bit_order,
         test_activation_preload_falls_back_to_phase_table,
+        test_phase_direction_override_beats_invert_dir_auto,
     ]
     for test in tests:
         test()

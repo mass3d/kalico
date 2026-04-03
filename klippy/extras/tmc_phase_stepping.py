@@ -57,6 +57,39 @@ def _phase_table_currents(mscnt):
             int(round(248.0 * math.sin(angle))))
 
 
+def _phase_from_currents(cur_a, cur_b):
+    if not cur_a and not cur_b:
+        return None
+    phase = int(round(math.atan2(cur_b, cur_a)
+                      * 1024.0 / (2.0 * math.pi)))
+    return phase & 0x3FF
+
+
+def _phase_delta(from_phase, to_phase):
+    if from_phase is None or to_phase is None:
+        return None
+    delta = (to_phase - from_phase) & 0x3FF
+    if delta >= 0x200:
+        delta -= 0x400
+    return delta
+
+
+def _phase_position_to_mcu_phase(position):
+    if position is None or not math.isfinite(position):
+        return None
+    reduced = math.fmod(position, 1024.0)
+    fixed = int(reduced * FIXED_POINT_SCALE)
+    return (fixed >> 16) & 0x3FF
+
+
+def _phase_from_mcu_start_position(start_position):
+    return (int(start_position) >> 16) & 0x3FF
+
+
+def _vector_peak_delta(cur_a, cur_b, next_a, next_b):
+    return max(abs(cur_a - next_a), abs(cur_b - next_b))
+
+
 def _activation_preload_currents(mscnt, mscuract_raw):
     cur_a, cur_b = _decode_mscuract(mscuract_raw)
     # Prefer the live current vector when available so direct_mode takes over
@@ -96,6 +129,8 @@ class MCU_phase_stepper:
             'phase_disable_faststandstill', True)
         self.max_error = config.getfloat('phase_compress_error', 0.25,
                                          above=0.)
+        self._phase_direction_override = config.getint(
+            'phase_direction_override', 0, minval=-1, maxval=1)
         self._phase_stepping_active = False
         self._mcu_hold_active = False
         self._needs_clock_reset = True
@@ -107,11 +142,16 @@ class MCU_phase_stepper:
         self._fault_handler = None
         self._phase_step_dist = None
         self._phase_direction = 1.0
+        self._phase_direction_source = 'invert_dir'
+        self._dir_inverted = False
         self._phase_offset = 0.0
         self._last_commanded_position = None
         self._activation_pending = False
         self._stagger_ticks = 0
         self._trace_events = []
+        self._activation_vector = {}
+        self._last_idle_vector = {}
+        self._last_continuity = {}
         # FFI handles
         ffi_main, ffi_lib = chelper.get_ffi()
         self._ffi_main = ffi_main
@@ -168,6 +208,46 @@ class MCU_phase_stepper:
         if self._status_cmd is None:
             return None
         return self._status_cmd.send([self.oid])
+    def _resolve_phase_direction(self, invert_dir):
+        if self._phase_direction_override:
+            direction = 1.0 if self._phase_direction_override > 0 else -1.0
+            return direction, 'override'
+        direction = -1.0 if invert_dir else 1.0
+        return direction, 'invert_dir'
+    def _phase_vector_from_position(self, phase_position):
+        phase = _phase_position_to_mcu_phase(phase_position)
+        if phase is None:
+            return None, None, None
+        cur_a, cur_b = _phase_table_currents(phase)
+        return phase, cur_a, cur_b
+    def _record_continuity(self, origin, from_phase, from_a, from_b, to_phase):
+        if from_phase is None or to_phase is None:
+            self._last_continuity = {}
+            return
+        if from_a is None or from_b is None:
+            from_a, from_b = _phase_table_currents(from_phase)
+        to_a, to_b = _phase_table_currents(to_phase)
+        delta_phase = _phase_delta(from_phase, to_phase)
+        delta_peak = _vector_peak_delta(from_a, from_b, to_a, to_b)
+        entry = {
+            'origin': origin,
+            'from_phase': from_phase,
+            'from_a': from_a,
+            'from_b': from_b,
+            'to_phase': to_phase,
+            'to_a': to_a,
+            'to_b': to_b,
+            'delta_phase': delta_phase,
+            'delta_peak': delta_peak,
+        }
+        self._last_continuity = entry
+        self._trace_event('continuity', **entry)
+        logging.info(
+            "Phase stepping %s: %s continuity from_phase=%d to_phase=%d"
+            " delta_phase=%+d delta_peak=%d"
+            " from_a=%d from_b=%d to_a=%d to_b=%d",
+            self.name, origin, from_phase, to_phase, delta_phase,
+            delta_peak, from_a, from_b, to_a, to_b)
     def set_tmc_obj(self, tmc_obj):
         self.tmc_obj = tmc_obj
     def _handle_connect(self):
@@ -284,8 +364,10 @@ class MCU_phase_stepper:
         # pairs. In direct_mode we must reverse the phase direction to match,
         # since there's no DIR signal to invert.
         invert_dir = self.stepper.get_dir_inverted()[0]
-        direction = -1.0 if invert_dir else 1.0
+        direction, dir_source = self._resolve_phase_direction(invert_dir)
+        self._dir_inverted = invert_dir
         self._phase_direction = direction
+        self._phase_direction_source = dir_source
         self._ffi_lib.phase_generator_set_direction(
             self._phase_generator, direction)
         # Calibrate phase offset: difference between TMC's internal phase
@@ -307,28 +389,58 @@ class MCU_phase_stepper:
                           mscuract_b=live_cur_b,
                           cmd_pos=self.stepper.get_commanded_position(),
                           klipper_phase=klipper_phase)
-        self._trace_event('activate_preload',
-                          preload_a=cur_a, preload_b=cur_b,
-                          source=preload_source, offset=phase_offset)
         # Verify direct_mode was actually set
         gconf_readback = mcu_tmc.get_register("GCONF")
         direct_mode_set = bool(gconf_readback & (1 << 16))
+        gconf_shaft = fields.get_field("shaft", gconf_readback, "GCONF")
         # Read back XDIRECT register to verify our preload write took effect
         xdirect_rb = mcu_tmc.get_register("XTARGET")
         xd_a, xd_b = _decode_xdirect(xdirect_rb)
+        preload_phase = _phase_from_currents(cur_a, cur_b)
+        xdirect_phase = _phase_from_currents(xd_a, xd_b)
+        xdirect_delta = _phase_delta(preload_phase, xdirect_phase)
+        self._activation_vector = {
+            'phase': preload_phase,
+            'a': cur_a,
+            'b': cur_b,
+            'source': preload_source,
+            'readback_phase': xdirect_phase,
+            'readback_a': xd_a,
+            'readback_b': xd_b,
+            'readback_delta': xdirect_delta,
+            'gconf_shaft': gconf_shaft,
+        }
+        self._last_idle_vector = {}
+        self._last_continuity = {}
+        self._trace_event('activate_preload',
+                          preload_a=cur_a, preload_b=cur_b,
+                          preload_phase=preload_phase,
+                          readback_a=xd_a, readback_b=xd_b,
+                          readback_phase=xdirect_phase,
+                          readback_delta=xdirect_delta,
+                          source=preload_source, offset=phase_offset,
+                          phase_dir=direction,
+                          phase_dir_source=dir_source,
+                          invert_dir=invert_dir,
+                          gconf_shaft=gconf_shaft)
         logging.info("Phase stepping %s: mscnt=%d klipper_phase=%d offset=%d"
-                     " dir=%.0f invert=%s microsteps=%d"
+                     " dir=%.0f dir_source=%s invert=%s gconf_shaft=%d"
+                     " microsteps=%d"
                      " phase_step_dist=%.6f GCONF=0x%08x direct_mode=%s"
                      " active_tpowerdown=%d"
                      " mscuract_a=%d mscuract_b=%d preload_source=%s"
-                     " preload_a=%d preload_b=%d xdirect_a=%d xdirect_b=%d"
+                     " preload_a=%d preload_b=%d preload_phase=%s"
+                     " xdirect_a=%d xdirect_b=%d xdirect_phase=%s"
+                     " xdirect_delta=%s"
                      " preload_raw=0x%08x xdirect_raw=0x%08x",
                      self.name, mscnt, klipper_phase, int(phase_offset),
-                     direction, invert_dir, microsteps,
+                     direction, dir_source, invert_dir, gconf_shaft,
+                     microsteps,
                      phase_step_dist, gconf_readback, direct_mode_set,
                      self.active_tpowerdown,
                      live_cur_a, live_cur_b, preload_source,
-                     cur_a, cur_b, xd_a, xd_b,
+                     cur_a, cur_b, preload_phase,
+                     xd_a, xd_b, xdirect_phase, xdirect_delta,
                      (cur_b_u16 << 16) | cur_a_u16, xdirect_rb)
         # Initialize last_flush_time to current print time so generator
         # doesn't try to sample from t=0 (boot time)
@@ -376,6 +488,15 @@ class MCU_phase_stepper:
                           boundary=boundary_time, label=label)
         return boundary_time
     def _enter_idle_hold(self, flush_time, phase_position, label):
+        hold_phase, hold_a, hold_b = self._phase_vector_from_position(
+            phase_position)
+        self._last_idle_vector = {
+            'phase': hold_phase,
+            'a': hold_a,
+            'b': hold_b,
+            'flush': flush_time,
+            'label': label,
+        }
         self._idle_position = phase_position
         self._idle_start_time = flush_time
         self._last_commanded_position = self._phase_to_commanded(phase_position)
@@ -391,7 +512,9 @@ class MCU_phase_stepper:
             self._phase_generator, phase_position)
         self._trace_event('idle', flush=flush_time, pos=phase_position,
                           label=label, reset=self._needs_clock_reset,
-                          mcu_hold=self._mcu_hold_active)
+                          mcu_hold=self._mcu_hold_active,
+                          hold_phase=hold_phase,
+                          hold_a=hold_a, hold_b=hold_b)
         if not self._had_zero_samples:
             self._had_zero_samples = True
             logging.info("phase_gen %s: %s at flush=%.3f pos=%.1f"
@@ -581,6 +704,9 @@ class MCU_phase_stepper:
                 self._enter_idle_hold(flush_time, first_pos, 'standstill')
                 return
         resuming_from_idle = self._idle_position is not None
+        resume_vector = (dict(self._last_idle_vector)
+                         if resuming_from_idle and self._last_idle_vector
+                         else None)
         move_start = None
         trim_start = None
         retried_resume = False
@@ -677,6 +803,24 @@ class MCU_phase_stepper:
                          self.name, num_segments,
                          flush_time - boundary_time, boundary_time)
             return
+        start_phase = _phase_from_mcu_start_position(
+            self._mcu_moves[0].start_position)
+        end_phase = _phase_position_to_mcu_phase(
+            self._positions[num_samples - 1])
+        if self._activation_pending and self._activation_vector:
+            self._record_continuity(
+                'activation',
+                self._activation_vector.get('phase'),
+                self._activation_vector.get('a'),
+                self._activation_vector.get('b'),
+                start_phase)
+        elif resume_vector:
+            self._record_continuity(
+                'idle_resume',
+                resume_vector.get('phase'),
+                resume_vector.get('a'),
+                resume_vector.get('b'),
+                start_phase)
         # Log first few segment details for diagnostics
         if self._move_log_count <= 3:
             for i in range(min(num_mcu, 3)):
@@ -711,12 +855,14 @@ class MCU_phase_stepper:
                               start=start_time, flush=flush_time,
                               first=self._positions[0],
                               last=self._positions[num_samples - 1],
+                              start_phase=start_phase,
                               reset=need_reset)
             self._activation_pending = False
         self._trace_event('queue_move', start=start_time, flush=flush_time,
                           samples=num_samples, mcu=num_mcu,
                           first=self._positions[0],
                           last=self._positions[num_samples - 1],
+                          start_phase=start_phase, end_phase=end_phase,
                           reset=need_reset)
 
 class TMCPhaseStepping:
@@ -754,6 +900,9 @@ class TMCPhaseStepping:
                                desc="Suspend phase stepping immediately")
         gcode.register_command('PHASE_STEPPER_RESUME', self.cmd_RESUME,
                                desc="Resume phase stepping now or after delay")
+        gcode.register_command('PHASE_STEPPER_SET_DIRECTION',
+                               self.cmd_SET_DIRECTION,
+                               desc="Override per-motor phase direction")
         gcode.register_command('PHASE_STEPPER_TRACE', self.cmd_TRACE,
                                desc="Dump recent host-side phase-stepper trace")
         gcode.register_command('PHASE_STEPPER_STATUS', self.cmd_STATUS,
@@ -837,10 +986,11 @@ class TMCPhaseStepping:
             self._resume_scheduled_generation = 0
             return self.reactor.NEVER
         if self._home_rails_depth or self._homing_move_depth:
-            logging.info("Phase stepping resume skipped:"
+            logging.info("Phase stepping resume deferred:"
                          " home_rails_depth=%d homing_move_depth=%d",
                          self._home_rails_depth, self._homing_move_depth)
-            return self.reactor.NEVER
+            self._probe_resume_deferred = False
+            return eventtime + 0.250
         if self._is_probe_busy():
             if not self._probe_resume_deferred:
                 logging.info("Phase stepping resume deferred:"
@@ -903,6 +1053,7 @@ class TMCPhaseStepping:
                                            "TPOWERDOWN"),
             'faststandstill': fields.get_field("faststandstill", gconf_cached,
                                                "GCONF"),
+            'shaft': fields.get_field("shaft", gconf_cached, "GCONF"),
             'active_tpowerdown': ps.active_tpowerdown,
         }
         if not live:
@@ -921,12 +1072,15 @@ class TMCPhaseStepping:
             'mscuract_raw': mscuract,
             'xdirect_a': xdirect_a,
             'xdirect_b': xdirect_b,
+            'xdirect_phase': _phase_from_currents(xdirect_a, xdirect_b),
             'mscuract_a': cur_a,
             'mscuract_b': cur_b,
+            'mscuract_phase': _phase_from_currents(cur_a, cur_b),
             'drv_status': drv_status,
             'gstat': gstat,
             'live_faststandstill': fields.get_field(
                 "faststandstill", live_gconf, "GCONF"),
+            'live_shaft': fields.get_field("shaft", live_gconf, "GCONF"),
             'cs_actual': fields.get_field("cs_actual", drv_status,
                                           "DRV_STATUS"),
             'fsactive': fields.get_field("fsactive", drv_status,
@@ -1109,6 +1263,53 @@ class TMCPhaseStepping:
                     tmc_state.get('gstat_drv_err', 'n/a'),
                     tmc_state.get('gstat_uv_cp', 'n/a'),
                     tmc_state.get('live_faststandstill', 'n/a')))
+            preload = ps._activation_vector
+            idle_vec = ps._last_idle_vector
+            continuity = ps._last_continuity
+            mcu_last_phase = mstat.get('last_phase', None)
+            if isinstance(mcu_last_phase, int):
+                mcu_last_a, mcu_last_b = _phase_table_currents(mcu_last_phase)
+            else:
+                mcu_last_a = mcu_last_b = 'n/a'
+            xtarget_to_mcu = ('n/a' if not isinstance(mcu_last_phase, int)
+                              else _phase_delta(
+                                  mcu_last_phase,
+                                  tmc_state.get('xdirect_phase')))
+            gcmd.respond_info(
+                "%s direct: phase_dir=%+.0f phase_dir_source=%s"
+                " dir_inverted=%s phase_offset=%.3f"
+                " cached_shaft=%s live_shaft=%s"
+                " preload_source=%s preload_phase=%s preload_a=%s preload_b=%s"
+                " preload_rb_phase=%s preload_rb_delta=%s"
+                " mscuract_phase=%s xtarget_phase=%s" % (
+                    name, ps._phase_direction, ps._phase_direction_source,
+                    ps._dir_inverted, ps._phase_offset,
+                    tmc_state.get('shaft', 'n/a'),
+                    tmc_state.get('live_shaft', 'n/a'),
+                    preload.get('source', 'n/a'),
+                    preload.get('phase', 'n/a'),
+                    preload.get('a', 'n/a'),
+                    preload.get('b', 'n/a'),
+                    preload.get('readback_phase', 'n/a'),
+                    preload.get('readback_delta', 'n/a'),
+                    tmc_state.get('mscuract_phase', 'n/a'),
+                    tmc_state.get('xdirect_phase', 'n/a')))
+            gcmd.respond_info(
+                "%s continuity: hold_phase=%s hold_a=%s hold_b=%s"
+                " origin=%s from_phase=%s to_phase=%s"
+                " delta_phase=%s delta_peak=%s"
+                " mcu_last_phase=%s mcu_last_a=%s mcu_last_b=%s"
+                " xtarget_to_mcu_delta=%s" % (
+                    name, idle_vec.get('phase', 'n/a'),
+                    idle_vec.get('a', 'n/a'),
+                    idle_vec.get('b', 'n/a'),
+                    continuity.get('origin', 'n/a'),
+                    continuity.get('from_phase', 'n/a'),
+                    continuity.get('to_phase', 'n/a'),
+                    continuity.get('delta_phase', 'n/a'),
+                    continuity.get('delta_peak', 'n/a'),
+                    mcu_last_phase if mcu_last_phase is not None else 'n/a',
+                    mcu_last_a, mcu_last_b, xtarget_to_mcu))
     def cmd_SUSPEND(self, gcmd):
         """PHASE_STEPPER_SUSPEND - disable phase stepping immediately."""
         self._deactivate_all("gcode suspend", flush_toolhead=True)
@@ -1169,10 +1370,62 @@ class TMCPhaseStepping:
         self._cancel_resume("gcode resume immediate")
         self._activate_all()
         gcmd.respond_info("Phase stepping resumed")
+    def cmd_SET_DIRECTION(self, gcmd):
+        """Override the resolved phase direction for one or more motors.
+        SIGN=-1 or SIGN=+1 forces the electrical phase sign.
+        SIGN=0 clears the override and returns to invert_dir auto mode.
+        MOTOR=stepper_y optionally limits the change to one motor.
+        REACTIVATE=1 restarts active phase stepping immediately so the
+        new direction takes effect without a printer restart."""
+        if not self.phase_steppers:
+            gcmd.respond_info("No phase steppers registered")
+            return
+        sign = gcmd.get_int("SIGN", minval=-1, maxval=1)
+        motor_filter = gcmd.get("MOTOR", None)
+        if motor_filter and motor_filter not in self.phase_steppers:
+            gcmd.respond_info("Unknown motor '%s'. Available: %s"
+                              % (motor_filter,
+                                 ", ".join(sorted(self.phase_steppers))))
+            return
+        names = ([motor_filter] if motor_filter
+                 else sorted(self.phase_steppers.keys()))
+        active_before = self._phase_stepping_enabled
+        reactivate = gcmd.get_int(
+            "REACTIVATE", 1 if active_before else 0, minval=0, maxval=1)
+        if reactivate and active_before:
+            if self._home_rails_depth or self._homing_move_depth:
+                reactivate = 0
+                gcmd.respond_info(
+                    "Homing is active; direction override will apply on the"
+                    " next activation instead of reactivating now")
+            else:
+                buffered_motion = self._buffered_motion_time()
+                if buffered_motion > 0.050:
+                    raise gcmd.error(
+                        "Refusing to change active phase direction with"
+                        " %.3fs of motion still buffered" % (buffered_motion,))
+                self._deactivate_all("direction override change",
+                                     flush_toolhead=True)
+        for name in names:
+            ps = self.phase_steppers[name]
+            ps._phase_direction_override = sign
+            effective, source = ps._resolve_phase_direction(
+                ps.stepper.get_dir_inverted()[0])
+            gcmd.respond_info(
+                "%s: phase_direction_override=%+d"
+                " effective_phase_dir=%+.0f source=%s"
+                % (name, sign, effective, source))
+        if reactivate and active_before:
+            self._activate_all()
+            gcmd.respond_info("Phase stepping reactivated with updated"
+                              " direction override")
     def cmd_TEST_XDIRECT(self, gcmd):
         """Drive motors through microsteps via direct_mode.
         STEPS=N (default 10000, negative for reverse direction)
         MOTOR=stepper_x (optional, test single motor only)
+        SIGN={-1,0,+1} forces electrical phase direction for audit
+        DWELL=<seconds> pauses between writes for visible probes
+        RESTORE=1 rewrites the starting hold vector before exit
         Run AFTER homing so TMC registers are initialized (IRUN>0)."""
         if not self.phase_steppers:
             gcmd.respond_info("No phase steppers registered")
@@ -1186,10 +1439,16 @@ class TMCPhaseStepping:
             return
         test_names = ([motor_filter] if motor_filter
                       else sorted(self.phase_steppers.keys()))
+        forced_sign = gcmd.get_int("SIGN", 0, minval=-1, maxval=1)
+        dwell = gcmd.get_float("DWELL", 0.0, minval=0.0)
+        restore_vector = gcmd.get_int("RESTORE", 1, minval=0, maxval=1)
         # Stop phase stepping ISR if active (we'll do our own writes)
-        for ps in self.phase_steppers.values():
+        was_active = {}
+        for name, ps in self.phase_steppers.items():
+            was_active[name] = ps._phase_stepping_active
             if ps._phase_stepping_active:
                 ps.stop_timer()
+        toolhead = self.printer.lookup_object("toolhead")
         # Dump TMC register state for diagnostics
         # (IHOLD_IRUN is write-only on TMC5160, skip it)
         for name in test_names:
@@ -1204,6 +1463,7 @@ class TMCPhaseStepping:
                 " PWMCONF=0x%08x" % (name, gconf, chopconf, toff, pwm_conf))
         # Set IHOLD=IRUN for each motor (direct_mode scales by IHOLD)
         saved_gconf = {}
+        saved_vectors = {}
         start_phases = {}
         for name in test_names:
             ps = self.phase_steppers[name]
@@ -1232,21 +1492,34 @@ class TMCPhaseStepping:
             # without a synthetic phase jump.
             a, b, source = _activation_preload_currents(mscnt, mscuract_raw)
             val = ((b & 0x1FF) << 16) | (a & 0x1FF)
+            saved_vectors[name] = val
             mcu_tmc.set_register("XTARGET", val)
             gcmd.respond_info(
-                "%s: MSCNT=%d IRUN=%d preload A=%d B=%d source=%s"
-                % (name, mscnt, irun, a, b, source))
+                "%s: MSCNT=%d IRUN=%d preload_phase=%s"
+                " preload A=%d B=%d source=%s"
+                % (name, mscnt, irun, _phase_from_currents(a, b),
+                   a, b, source))
         # Determine per-motor MSCNT direction from dir_pin inversion.
-        # Motors with inverted dir_pin need -MSCNT to match their belt
-        # partner's +MSCNT (they're physically mounted opposite).
+        # The ordinary motion path may override the invert_dir-based default
+        # when direct-mode hardware proves the electrical sign is different.
         motor_dirs = {}
         for name in test_names:
             ps = self.phase_steppers[name]
             invert = ps.stepper.get_dir_inverted()[0]
-            motor_dirs[name] = -1 if invert else 1
+            auto_direction = -1 if invert else 1
+            if forced_sign:
+                effective_direction = forced_sign
+                direction_source = "gcode"
+            else:
+                resolved, direction_source = ps._resolve_phase_direction(
+                    invert)
+                effective_direction = int(resolved)
+            motor_dirs[name] = effective_direction
             gcmd.respond_info(
-                "%s: invert_dir=%s motor_dir=%+d"
-                % (name, invert, motor_dirs[name]))
+                "%s: invert_dir=%s auto_phase_dir=%+d"
+                " effective_phase_dir=%+d dir_source=%s"
+                % (name, invert, auto_direction,
+                   motor_dirs[name], direction_source))
         steps = gcmd.get_int("STEPS", 10000)
         step_dir = 1 if steps >= 0 else -1
         abs_steps = abs(steps)
@@ -1266,16 +1539,37 @@ class TMCPhaseStepping:
                 b = int(round(248.0 * math.sin(angle)))
                 val = ((b & 0x1FF) << 16) | (a & 0x1FF)
                 mcu_tmc.set_register("XTARGET", val)
+            if dwell > 0.0:
+                toolhead.dwell(dwell)
         gcmd.respond_info("Done. Restoring registers...")
         # Restore GCONF and IHOLD_IRUN from config cache
         for name in test_names:
             ps = self.phase_steppers[name]
             mcu_tmc = ps.tmc_obj.mcu_tmc
+            if restore_vector:
+                mcu_tmc.set_register("XTARGET", saved_vectors[name])
+                if dwell > 0.0:
+                    toolhead.dwell(dwell)
+            final_xdirect = mcu_tmc.get_register("XTARGET")
+            final_mscuract = mcu_tmc.get_register("MSCURACT")
+            final_a, final_b = _decode_xdirect(final_xdirect)
+            cur_a, cur_b = _decode_mscuract(final_mscuract)
+            gcmd.respond_info(
+                "%s: final_xtarget_phase=%s final_xtarget_a=%d"
+                " final_xtarget_b=%d final_mscuract_phase=%s"
+                " final_mscuract_a=%d final_mscuract_b=%d"
+                % (name, _phase_from_currents(final_a, final_b),
+                   final_a, final_b,
+                   _phase_from_currents(cur_a, cur_b),
+                   cur_a, cur_b))
             mcu_tmc.set_register("GCONF", saved_gconf[name])
             fields = mcu_tmc.fields
             ihr_cached = fields.registers.get("IHOLD_IRUN", None)
             if ihr_cached is not None:
                 mcu_tmc.set_register("IHOLD_IRUN", ihr_cached)
+        for name, was_running in was_active.items():
+            if was_running:
+                self.phase_steppers[name].activate()
         gcmd.respond_info("TEST_XDIRECT done.")
     def register_phase_stepper(self, name, phase_stepper):
         phase_stepper.set_fault_handler(self._handle_phase_fault)
