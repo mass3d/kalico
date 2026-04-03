@@ -112,10 +112,14 @@ struct tmc_phase_stepper {
 
 static struct {
     struct timer timer;
+    struct spi_config spi_cfg;      // Cached SPI config (shared bus)
     uint32_t interval;              // Ticks between group ticks
     struct tmc_phase_stepper *motors[MAX_GROUP_MOTORS];
+    struct gpio_out cs_pins[MAX_GROUP_MOTORS];
+    uint8_t cs_active_high[MAX_GROUP_MOTORS];
     uint8_t motor_count;            // Number of registered motors
     uint8_t active;                 // Group timer is running
+    uint8_t spi_configured;         // SPI config has been cached
     uint32_t group_tick_count;      // Total group ticks
 } group_isr;
 
@@ -177,6 +181,23 @@ group_phase_stepper_event(struct timer *t)
 {
     group_isr.group_tick_count++;
 
+    // Check host SPI contention once — no host code runs mid-ISR,
+    // so if the bus is free now it stays free for all motors.
+    if (spidev_is_bus_busy()) {
+        // Skip entire tick — all motors stay synchronized
+        uint8_t n = group_isr.motor_count;
+        for (uint8_t i = 0; i < n; i++) {
+            struct tmc_phase_stepper *ps = group_isr.motors[i];
+            if (ps && ps->count > 0)
+                ps->skip_count++;
+        }
+        group_isr.timer.waketime += group_isr.interval;
+        return SF_RESCHEDULE;
+    }
+
+    // Claim the bus for the duration of the group ISR
+    spidev_set_bus_busy(1);
+
     uint8_t any_active = 0;
     uint8_t n = group_isr.motor_count;
     for (uint8_t i = 0; i < n; i++) {
@@ -191,27 +212,30 @@ group_phase_stepper_event(struct timer *t)
         uint16_t phase = (uint16_t)((ps->position >> 16) & 0x3FF);
 
         if (ps->mode == PM_MODE_DIRECT_CURRENT) {
-            // Write coil currents via SPI — same path as original ISR
-            if (!spidev_is_bus_busy()) {
-                int16_t cur_a = (phase_cos(phase)
-                                 * (int16_t)ps->current_scale) >> 8;
-                int16_t cur_b = (phase_sin(phase)
-                                 * (int16_t)ps->current_scale) >> 8;
-                uint16_t ua = (uint16_t)cur_a & 0x1FF;
-                uint16_t ub = (uint16_t)cur_b & 0x1FF;
-                uint8_t msg[5];
-                msg[0] = 0x2D | 0x80;
-                msg[1] = (uint8_t)(ub >> 8);
-                msg[2] = (uint8_t)(ub);
-                msg[3] = (uint8_t)(ua >> 8);
-                msg[4] = (uint8_t)(ua);
+            int16_t cur_a = (phase_cos(phase)
+                             * (int16_t)ps->current_scale) >> 8;
+            int16_t cur_b = (phase_sin(phase)
+                             * (int16_t)ps->current_scale) >> 8;
+            uint16_t ua = (uint16_t)cur_a & 0x1FF;
+            uint16_t ub = (uint16_t)cur_b & 0x1FF;
+            uint8_t msg[5];
+            msg[0] = 0x2D | 0x80;
+            msg[1] = (uint8_t)(ub >> 8);
+            msg[2] = (uint8_t)(ub);
+            msg[3] = (uint8_t)(ua >> 8);
+            msg[4] = (uint8_t)(ua);
 
-                spidev_transfer(ps->spi, 0, sizeof(msg), msg);
-                ps->write_count++;
-                ps->last_phase = phase;
-            } else {
-                ps->skip_count++;
-            }
+            // Read SPI config and CS live from spidev (no caching)
+            struct spi_config cfg = spidev_get_spi_config(ps->spi);
+            struct gpio_out cs = spidev_get_cs_pin(ps->spi);
+            uint8_t cs_hi = spidev_is_cs_active_high(ps->spi);
+            spi_prepare(cfg);
+            gpio_out_write(cs, cs_hi);   // assert
+            spi_transfer(cfg, 0, sizeof(msg), msg);
+            gpio_out_write(cs, !cs_hi);  // deassert
+
+            ps->write_count++;
+            ps->last_phase = phase;
         }
         ps->last_emitted_position = emitted_position;
 
@@ -225,6 +249,8 @@ group_phase_stepper_event(struct timer *t)
             phase_stepper_load_next(ps);
         }
     }
+
+    spidev_set_bus_busy(0);
 
     // Stop group timer if all motors are fully stopped
     if (!any_active && all_motors_stopped()) {
@@ -310,6 +336,18 @@ command_queue_phase_move(uint32_t *args)
         // Start group timer if not already running
         if (!group_isr.active) {
             group_isr.interval = interval;
+            // Cache SPI config and CS pins on first start
+            // (guaranteed after spi_set_bus has configured the bus)
+            if (!group_isr.spi_configured) {
+                group_isr.spi_cfg = spidev_get_spi_config(ps->spi);
+                for (uint8_t j = 0; j < group_isr.motor_count; j++) {
+                    struct tmc_phase_stepper *m = group_isr.motors[j];
+                    group_isr.cs_pins[j] = spidev_get_cs_pin(m->spi);
+                    group_isr.cs_active_high[j] =
+                        spidev_is_cs_active_high(m->spi);
+                }
+                group_isr.spi_configured = 1;
+            }
             // Preserve waketime from reset_phase_clock if still valid
             uint32_t now = timer_read_time();
             if ((int32_t)(group_isr.timer.waketime - now)
