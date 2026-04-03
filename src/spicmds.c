@@ -101,6 +101,17 @@ spidev_get_cs_pin(struct spidev_s *spi)
     return spi->pin;
 }
 
+// SPI bus busy flag for ISR contention avoidance
+static volatile uint8_t spi_bus_busy;
+// SPI bus hold flag — keeps ISR from writing between multi-transaction sequences
+static volatile uint8_t spi_bus_hold;
+
+uint8_t
+spidev_is_bus_busy(void)
+{
+    return spi_bus_busy || spi_bus_hold;
+}
+
 void
 spidev_transfer(struct spidev_s *spi, uint8_t receive_data
                 , uint8_t data_len, uint8_t *data)
@@ -109,6 +120,8 @@ spidev_transfer(struct spidev_s *spi, uint8_t receive_data
     if (!(flags & (SF_SOFTWARE|SF_HARDWARE)))
         // Not yet initialized
         return;
+
+    spi_bus_busy = 1;
 
     if (CONFIG_WANT_SOFTWARE_SPI && flags & SF_SOFTWARE)
         spi_software_prepare(spi->spi_software);
@@ -125,6 +138,8 @@ spidev_transfer(struct spidev_s *spi, uint8_t receive_data
 
     if (flags & SF_HAVE_PIN)
         gpio_out_write(spi->pin, !(flags & SF_CS_ACTIVE_HIGH));
+
+    spi_bus_busy = 0;
 }
 
 void
@@ -135,6 +150,7 @@ command_spi_transfer(uint32_t *args)
     uint8_t data_len = args[1];
     uint8_t *data = command_decode_ptr(args[2]);
     spidev_transfer(spi, 1, data_len, data);
+    spi_bus_hold = 0;  // Auto-release hold after read completes
     sendf("spi_transfer_response oid=%c response=%*s", oid, data_len, data);
 }
 DECL_COMMAND(command_spi_transfer, "spi_transfer oid=%c data=%*s");
@@ -148,6 +164,17 @@ command_spi_send(uint32_t *args)
     spidev_transfer(spi, 0, data_len, data);
 }
 DECL_COMMAND(command_spi_send, "spi_send oid=%c data=%*s");
+
+void
+command_spi_send_hold(uint32_t *args)
+{
+    struct spidev_s *spi = spidev_oid_lookup(args[0]);
+    uint8_t data_len = args[1];
+    uint8_t *data = command_decode_ptr(args[2]);
+    spidev_transfer(spi, 0, data_len, data);
+    spi_bus_hold = 1;  // Hold bus until next spi_transfer completes
+}
+DECL_COMMAND(command_spi_send_hold, "spi_send_hold oid=%c data=%*s");
 
 
 /****************************************************************
@@ -178,6 +205,7 @@ DECL_COMMAND(command_config_spi_shutdown,
 void
 spidev_shutdown(void)
 {
+    spi_bus_hold = 0;
     // Cancel any transmissions that may be in progress
     uint8_t oid;
     struct spidev_s *spi;

@@ -146,7 +146,7 @@ phase_stepper_event(struct timer *t)
 
     ps->event_count++;
 
-    // Write coil currents via SPI FIRST, using current position
+    // Write coil currents via SPI FIRST, using current position.
     if (!spidev_is_bus_busy()) {
         uint16_t phase = (uint16_t)((ps->position >> 16) & 0x3FF);
 
@@ -275,11 +275,10 @@ command_stop_phase_stepper(uint32_t *args)
     ps->acceleration = 0;
     ps->flags = PSF_NEED_RESET;
     irq_enable();
-    // Zero coil currents
-    if (ps->mode == PM_MODE_DIRECT_CURRENT) {
-        uint8_t msg[5] = { 0x2D | 0x80, 0, 0, 0, 0 };
-        spidev_transfer(ps->spi, 0, sizeof(msg), msg);
-    }
+    // Leave XDIRECT at its last held value — the host will restore
+    // GCONF (clearing direct_mode) which returns the TMC to normal
+    // step/dir with its own current regulation. Zeroing coil currents
+    // here causes an audible click from the momentary torque loss.
     // Flush move queue
     while (!move_queue_empty(&ps->mq)) {
         struct move_node *mn = move_queue_pop(&ps->mq);
@@ -351,11 +350,7 @@ phase_stepper_stop(struct trsync_signal *tss, uint8_t reason)
     ps->velocity = 0;
     ps->acceleration = 0;
     ps->flags = PSF_NEED_RESET;
-    // Zero the coil currents on stop
-    if (ps->mode == PM_MODE_DIRECT_CURRENT) {
-        uint8_t msg[5] = { 0x2D | 0x80, 0, 0, 0, 0 };
-        spidev_transfer(ps->spi, 0, sizeof(msg), msg);
-    }
+    // Leave XDIRECT at last held value (see stop_phase_stepper comment)
     while (!move_queue_empty(&ps->mq)) {
         struct move_node *mn = move_queue_pop(&ps->mq);
         struct phase_move *pm = container_of(mn, struct phase_move, node);
@@ -376,7 +371,7 @@ command_tmc_phase_stepper_stop_on_trigger(uint32_t *args)
 DECL_COMMAND(command_tmc_phase_stepper_stop_on_trigger,
              "tmc_phase_stepper_stop_on_trigger oid=%c trsync_oid=%c");
 
-// Shutdown handler: zero XDIRECT currents
+// Shutdown handler
 void
 tmc_phase_stepper_shutdown(void)
 {

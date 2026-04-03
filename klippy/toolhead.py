@@ -122,6 +122,10 @@ class Move:
         )
 
     def set_junction(self, start_v2, cruise_v2, end_v2):
+        max_jerk = self.toolhead.max_jerk
+        if max_jerk > 0. and self.is_kinematic_move:
+            return self._set_junction_scurve(
+                start_v2, cruise_v2, end_v2, max_jerk)
         # Determine accel, cruise, and decel portions of the move distance
         half_inv_accel = 0.5 / self.accel
         accel_d = (cruise_v2 - start_v2) * half_inv_accel
@@ -136,6 +140,75 @@ class Move:
         self.accel_t = accel_d / ((start_v + cruise_v) * 0.5)
         self.cruise_t = cruise_d / cruise_v
         self.decel_t = decel_d / ((end_v + cruise_v) * 0.5)
+
+    def _set_junction_scurve(self, start_v2, cruise_v2, end_v2, jerk_max):
+        accel = self.accel
+        self.start_v = start_v = math.sqrt(start_v2)
+        self.cruise_v = cruise_v = math.sqrt(cruise_v2)
+        self.end_v = end_v = math.sqrt(end_v2)
+        # Jerk phase duration: time to ramp accel from 0 to a_max
+        tj_max = accel / jerk_max
+        # --- Acceleration side (start_v -> cruise_v) ---
+        delta_v_accel = cruise_v - start_v
+        if delta_v_accel < 1e-10:
+            self.scurve_tj1 = self.scurve_ta = 0.
+        else:
+            # Velocity gained during one jerk phase: 0.5 * j * tj^2
+            v_j = 0.5 * jerk_max * tj_max * tj_max
+            if delta_v_accel < 2. * v_j:
+                # Triangular accel profile (never reaches a_max)
+                tj1 = math.sqrt(delta_v_accel / jerk_max)
+                self.scurve_tj1 = tj1
+                self.scurve_ta = 0.
+            else:
+                # Full trapezoidal accel profile
+                self.scurve_tj1 = tj_max
+                self.scurve_ta = (delta_v_accel - 2. * v_j) / accel
+        # --- Deceleration side (cruise_v -> end_v) ---
+        delta_v_decel = cruise_v - end_v
+        if delta_v_decel < 1e-10:
+            self.scurve_tj2 = self.scurve_td = 0.
+        else:
+            v_j = 0.5 * jerk_max * tj_max * tj_max
+            if delta_v_decel < 2. * v_j:
+                tj2 = math.sqrt(delta_v_decel / jerk_max)
+                self.scurve_tj2 = tj2
+                self.scurve_td = 0.
+            else:
+                self.scurve_tj2 = tj_max
+                self.scurve_td = (delta_v_decel - 2. * v_j) / accel
+        # Compute distances consumed by accel and decel phases
+        tj1 = self.scurve_tj1
+        ta = self.scurve_ta
+        tj2 = self.scurve_tj2
+        td = self.scurve_td
+        # Accel distance: phases 1+2+3
+        accel_d = (start_v * (2.*tj1 + ta)
+                   + jerk_max * tj1 * (tj1*tj1
+                                       + 1.5*tj1*ta + .5*ta*ta))
+        # Decel distance: phases 5+6+7
+        decel_d = (cruise_v * (2.*tj2 + td)
+                   - jerk_max * tj2 * (tj2*tj2
+                                       + 1.5*tj2*td + .5*td*td))
+        # Cruise distance is the residual
+        cruise_d = self.move_d - accel_d - decel_d
+        if cruise_d < -1e-10:
+            # Move too short for S-curve profile -- fall back to trapezoidal
+            half_inv_accel = .5 / accel
+            accel_d = (cruise_v2 - start_v2) * half_inv_accel
+            decel_d = (cruise_v2 - end_v2) * half_inv_accel
+            cruise_d = self.move_d - accel_d - decel_d
+            self.accel_t = accel_d / ((start_v + cruise_v) * 0.5)
+            self.cruise_t = cruise_d / cruise_v
+            self.decel_t = decel_d / ((end_v + cruise_v) * 0.5)
+            return
+        self.scurve_tc = cruise_d / cruise_v if cruise_v > 0. else 0.
+        # Store total move time for the trapezoidal fields (used by
+        # timing callbacks and move_time accounting)
+        self.accel_t = 2.*tj1 + ta
+        self.cruise_t = self.scurve_tc
+        self.decel_t = 2.*tj2 + td
+        self.scurve_jerk = jerk_max
 
 
 LOOKAHEAD_FLUSH_TIME = 0.250
@@ -286,11 +359,13 @@ class ToolHead:
         self.square_corner_velocity = config.getfloat(
             "square_corner_velocity", 5.0, minval=0.0
         )
+        self.max_jerk = config.getfloat("max_jerk", 0., minval=0.)
         self.orig_cfg = {}
         self.orig_cfg["max_velocity"] = self.max_velocity
         self.orig_cfg["max_accel"] = self.max_accel
         self.orig_cfg["min_cruise_ratio"] = self.min_cruise_ratio
         self.orig_cfg["square_corner_velocity"] = self.square_corner_velocity
+        self.orig_cfg["max_jerk"] = self.max_jerk
         self.junction_deviation = self.max_accel_to_decel = 0
         self._calc_junction_deviation()
         # Input stall detection
@@ -320,6 +395,7 @@ class ToolHead:
         ffi_main, ffi_lib = chelper.get_ffi()
         self.trapq = ffi_main.gc(ffi_lib.trapq_alloc(), ffi_lib.trapq_free)
         self.trapq_append = ffi_lib.trapq_append
+        self.trapq_append_scurve = ffi_lib.trapq_append_scurve
         self.trapq_finalize_moves = ffi_lib.trapq_finalize_moves
         self.step_generators = []
         # Create kinematics class
@@ -462,22 +538,43 @@ class ToolHead:
         next_move_time = self.print_time
         for move in moves:
             if move.is_kinematic_move:
-                self.trapq_append(
-                    self.trapq,
-                    next_move_time,
-                    move.accel_t,
-                    move.cruise_t,
-                    move.decel_t,
-                    move.start_pos[0],
-                    move.start_pos[1],
-                    move.start_pos[2],
-                    move.axes_r[0],
-                    move.axes_r[1],
-                    move.axes_r[2],
-                    move.start_v,
-                    move.cruise_v,
-                    move.accel,
-                )
+                if hasattr(move, 'scurve_jerk'):
+                    self.trapq_append_scurve(
+                        self.trapq,
+                        next_move_time,
+                        move.start_pos[0],
+                        move.start_pos[1],
+                        move.start_pos[2],
+                        move.axes_r[0],
+                        move.axes_r[1],
+                        move.axes_r[2],
+                        move.start_v,
+                        move.scurve_jerk,
+                        move.accel,
+                        move.cruise_v,
+                        move.scurve_tj1,
+                        move.scurve_ta,
+                        move.scurve_tc,
+                        move.scurve_tj2,
+                        move.scurve_td,
+                    )
+                else:
+                    self.trapq_append(
+                        self.trapq,
+                        next_move_time,
+                        move.accel_t,
+                        move.cruise_t,
+                        move.decel_t,
+                        move.start_pos[0],
+                        move.start_pos[1],
+                        move.start_pos[2],
+                        move.axes_r[0],
+                        move.axes_r[1],
+                        move.axes_r[2],
+                        move.start_v,
+                        move.cruise_v,
+                        move.accel,
+                    )
             if move.axes_d[3]:
                 self.extruder.move(next_move_time, move)
             next_move_time = (
@@ -740,6 +837,7 @@ class ToolHead:
                 "max_accel": self.max_accel,
                 "minimum_cruise_ratio": self.min_cruise_ratio,
                 "square_corner_velocity": self.square_corner_velocity,
+                "max_jerk": self.max_jerk,
             }
         )
         return res
@@ -821,6 +919,7 @@ class ToolHead:
                 min_cruise_ratio = 1.0 - min(
                     1.0, (req_accel_to_decel / self.max_accel)
                 )
+        max_jerk = gcmd.get_float("JERK", None, minval=0.)
         if max_velocity is not None:
             self.max_velocity = max_velocity
         if max_accel is not None:
@@ -829,6 +928,8 @@ class ToolHead:
             self.square_corner_velocity = square_corner_velocity
         if min_cruise_ratio is not None:
             self.min_cruise_ratio = min_cruise_ratio
+        if max_jerk is not None:
+            self.max_jerk = max_jerk
         msg = [
             "max_velocity: %.6f" % self.max_velocity,
             "max_accel: %.6f" % self.max_accel,
@@ -876,6 +977,7 @@ class ToolHead:
             (
                 "minimum_cruise_ratio: %.6f" % self.min_cruise_ratio,
                 "square_corner_velocity: %.6f" % self.square_corner_velocity,
+                "max_jerk: %.6f" % self.max_jerk,
             )
         )
 
@@ -888,6 +990,7 @@ class ToolHead:
                 and max_accel is None
                 and square_corner_velocity is None
                 and min_cruise_ratio is None
+                and max_jerk is None
             ):
                 gcmd.respond_info("\n".join(msg), log=False)
 
@@ -896,6 +999,7 @@ class ToolHead:
     def cmd_RESET_VELOCITY_LIMIT(self, gcmd):
         self.max_velocity = self.orig_cfg["max_velocity"]
         self.max_accel = self.orig_cfg["max_accel"]
+        self.max_jerk = self.orig_cfg["max_jerk"]
         msg = [
             "max_velocity: %.6f" % self.max_velocity,
             "max_accel: %.6f" % self.max_accel,
@@ -934,6 +1038,7 @@ class ToolHead:
             (
                 "minimum_cruise_ratio: %.6f" % self.min_cruise_ratio,
                 "square_corner_velocity: %.6f" % self.square_corner_velocity,
+                "max_jerk: %.6f" % self.max_jerk,
             )
         )
         if get_danger_options().log_velocity_limit_changes:
