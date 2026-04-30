@@ -14,5 +14,8 @@ void spidev_transfer(struct spidev_s *spi, uint8_t receive_data
                      , uint8_t data_len, uint8_t *data);
 uint8_t spidev_is_bus_busy(void);
 void spidev_set_bus_busy(uint8_t busy);
+void spidev_prepare_bus(struct spidev_s *spi);
+void spidev_transfer_prepared(struct spidev_s *spi, uint8_t data_len,
+                              uint8_t *data);
 
 #endif // spicmds.h
