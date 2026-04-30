@@ -7,6 +7,7 @@
 #include <string.h> // memcpy
 #include "autoconf.h" // CONFIG_WANT_SOFTWARE_SPI
 #include "board/gpio.h" // gpio_out_write
+#include "board/irq.h" // irq_disable
 #include "basecmd.h" // oid_alloc
 #include "command.h" // DECL_COMMAND
 #include "sched.h" // DECL_SHUTDOWN
@@ -130,6 +131,28 @@ spidev_set_bus_busy(uint8_t busy)
     spi_bus_busy = busy;
 }
 
+// Prepare SPI bus for a series of ISR transfers.
+// Caller must check spidev_is_bus_busy() first.
+void
+spidev_prepare_bus(struct spidev_s *spi)
+{
+    spi_prepare(spi->spi_config);
+}
+
+// Transfer data with CS handling, skipping spi_prepare and bus_busy.
+// Caller must call spidev_prepare_bus() first and manage bus_busy.
+void
+spidev_transfer_prepared(struct spidev_s *spi, uint8_t data_len,
+                         uint8_t *data)
+{
+    uint_fast8_t flags = spi->flags;
+    if (flags & SF_HAVE_PIN)
+        gpio_out_write(spi->pin, !!(flags & SF_CS_ACTIVE_HIGH));
+    spi_transfer(spi->spi_config, 0, data_len, data);
+    if (flags & SF_HAVE_PIN)
+        gpio_out_write(spi->pin, !(flags & SF_CS_ACTIVE_HIGH));
+}
+
 void
 spidev_transfer(struct spidev_s *spi, uint8_t receive_data
                 , uint8_t data_len, uint8_t *data)
@@ -189,8 +212,12 @@ command_spi_send_hold(uint32_t *args)
     struct spidev_s *spi = spidev_oid_lookup(args[0]);
     uint8_t data_len = args[1];
     uint8_t *data = command_decode_ptr(args[2]);
+    // Set hold before the preface transfer. Otherwise the phase ISR can run
+    // after spidev_transfer() clears spi_bus_busy but before hold is asserted.
+    irq_disable();
+    spi_bus_hold = 1;
+    irq_enable();
     spidev_transfer(spi, 0, data_len, data);
-    spi_bus_hold = 1;  // Hold bus until next spi_transfer completes
 }
 DECL_COMMAND(command_spi_send_hold, "spi_send_hold oid=%c data=%*s");
 

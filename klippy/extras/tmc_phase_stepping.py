@@ -113,6 +113,10 @@ class MCU_phase_stepper:
         self.update_rate = config.getfloat('phase_update_rate', 10000.,
                                            above=1000., maxval=50000.)
         self.update_interval = 1. / self.update_rate
+        self.bus_slots = config.getint('phase_bus_slots', 0,
+                                       minval=0, maxval=4)
+        self.bus_slot = config.getint('phase_bus_slot', -1,
+                                      minval=-1, maxval=3)
         max_idle_lookback = (MAX_PHASE_SAMPLES - 1) * self.update_interval
         self.idle_lookback = min(
             config.getfloat('phase_idle_lookback', 0.5, minval=0.0),
@@ -171,6 +175,7 @@ class MCU_phase_stepper:
                                        MAX_PHASE_SEGMENTS)
         # MCU command handles (filled during _build_config)
         self._queue_cmd = self._reset_cmd = self._set_current_cmd = None
+        self._set_slot_cmd = None
         self._stop_cmd = None
         self.mcu.register_config_callback(self._build_config)
         self.printer.register_event_handler('klippy:connect',
@@ -196,6 +201,8 @@ class MCU_phase_stepper:
             "reset_phase_clock oid=%c clock=%u")
         self._set_current_cmd = self.mcu.lookup_command(
             "set_phase_stepper_current oid=%c scale=%hu")
+        self._set_slot_cmd = self.mcu.lookup_command(
+            "set_phase_stepper_slot oid=%c slot=%c slot_count=%c")
         self._stop_cmd = self.mcu.lookup_command(
             "stop_phase_stepper oid=%c")
         self._status_cmd = self.mcu.lookup_query_command(
@@ -208,6 +215,13 @@ class MCU_phase_stepper:
         if self._status_cmd is None:
             return None
         return self._status_cmd.send([self.oid])
+    def set_bus_slot(self, slot, slot_count):
+        if self._set_slot_cmd is None:
+            return
+        self._set_slot_cmd.send([self.oid, slot, slot_count])
+        self.bus_slot = slot
+        self.bus_slots = slot_count
+        self._trace_event('bus_slot', slot=slot, slot_count=slot_count)
     def _resolve_phase_direction(self, invert_dir):
         if self._phase_direction_override:
             direction = 1.0 if self._phase_direction_override > 0 else -1.0
@@ -900,11 +914,46 @@ class TMCPhaseStepping:
                                desc="Query phase stepper diagnostics")
         gcode.register_command('TEST_XDIRECT', self.cmd_TEST_XDIRECT,
                                desc="Manual XDIRECT test on first stepper")
+    def _phase_axis_key(self, name):
+        suffix = name.split()[-1]
+        if suffix.startswith("stepper_"):
+            suffix = suffix[len("stepper_"):]
+        return suffix[:1].lower() if suffix else name
+    def _auto_bus_slot(self, name, slot_count):
+        axis = self._phase_axis_key(name)
+        preferred = {'x': 0, 'y': 1, 'z': 2}
+        if axis in preferred and preferred[axis] < slot_count:
+            return preferred[axis]
+        axes = []
+        for pname in sorted(self.phase_steppers):
+            paxis = self._phase_axis_key(pname)
+            if paxis not in axes:
+                axes.append(paxis)
+        return axes.index(axis) % slot_count
+    def _configure_bus_slots(self):
+        if not self.phase_steppers:
+            return
+        explicit_slots = [ps.bus_slots for ps in self.phase_steppers.values()
+                          if ps.bus_slots]
+        slot_count = max(explicit_slots) if explicit_slots else (
+            2 if len(self.phase_steppers) > 2 else 1)
+        slot_count = max(1, min(4, slot_count))
+        for name, ps in sorted(self.phase_steppers.items()):
+            slot = ps.bus_slot if ps.bus_slot >= 0 else (
+                self._auto_bus_slot(name, slot_count))
+            if slot >= slot_count:
+                raise self.printer.command_error(
+                    "%s phase_bus_slot=%d is outside phase_bus_slots=%d"
+                    % (name, slot, slot_count))
+            ps.set_bus_slot(slot, slot_count)
+            logging.info("Phase stepping %s: bus_slot=%d/%d",
+                         name, slot, slot_count)
     def _activate_all(self):
         # Activate all phase steppers without forcing a cross-motor stagger.
         # The MCU scheduler keeps independent due times on one shared clock.
         if self._phase_stepping_enabled:
             return
+        self._configure_bus_slots()
         for name, ps in self.phase_steppers.items():
             ps.activate(stagger_ticks=0)
         self._phase_stepping_enabled = True
@@ -1105,7 +1154,8 @@ class TMCPhaseStepping:
                              name, e)
             gcmd.respond_info(
                 "%s: active=%s needs_reset=%s expected_end_clock=%d"
-                " update_hz=%.0f idle_lookback=%.3f resume_lookback=%.3f"
+                " update_hz=%.0f bus_slot=%d/%d"
+                " idle_lookback=%.3f resume_lookback=%.3f"
                 " idle_hold_cfg=%.3f"
                 " sample_window=%.3f"
                 " max_error=%.3f"
@@ -1124,7 +1174,8 @@ class TMCPhaseStepping:
                 " live_faststandstill=%s" % (
                     name, ps._phase_stepping_active,
                     ps._needs_clock_reset, ps._expected_end_clock,
-                    ps.update_rate, ps.idle_lookback,
+                    ps.update_rate, ps.bus_slot, ps.bus_slots,
+                    ps.idle_lookback,
                     ps.resume_lookback,
                     ps.idle_hold_time,
                     (MAX_PHASE_SAMPLES - 1) * ps.update_interval,
