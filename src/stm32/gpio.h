@@ -54,6 +54,11 @@ void spi_prepare(struct spi_config config);
 void spi_transfer(struct spi_config config, uint8_t receive_data
                   , uint8_t len, uint8_t *data);
 
+// DMA SPI primitive — implemented in stm32h7_spi.c when CONFIG_WANT_SPI_DMA
+// is set.  Declared in spicmds.h with a forward-typed function-pointer
+// argument; spicmds.c locally provides the extern prototype that uses
+// spi_dma_done_fn from spicmds.h.
+
 struct i2c_config {
     void *i2c;
     uint8_t addr;

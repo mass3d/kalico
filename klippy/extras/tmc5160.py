@@ -208,10 +208,10 @@ Fields["MSLUTSTART"] = {
     "start_sin90": 0xFF << 16,
 }
 Fields["MSCNT"] = {"mscnt": 0x3FF << 0}
-Fields["MSCURACT"] = {"cur_b": 0x1FF << 0, "cur_a": 0x1FF << 16}
+Fields["MSCURACT"] = {"cur_a": 0x1FF << 0, "cur_b": 0x1FF << 16}
 Fields["LOST_STEPS"] = {"lost_steps": 0xFFFFF << 0}
 Fields["MSCNT"] = {"mscnt": 0x3FF << 0}
-Fields["MSCURACT"] = {"cur_b": 0x1FF << 0, "cur_a": 0x1FF << 16}
+Fields["MSCURACT"] = {"cur_a": 0x1FF << 0, "cur_b": 0x1FF << 16}
 Fields["OTP_READ"] = {
     "otp_fclktrim": 0x1F << 0,
     "otp_s2_level": 0x01 << 5,

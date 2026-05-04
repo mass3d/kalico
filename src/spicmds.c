@@ -153,6 +153,109 @@ spidev_transfer_prepared(struct spidev_s *spi, uint8_t data_len,
         gpio_out_write(spi->pin, !(flags & SF_CS_ACTIVE_HIGH));
 }
 
+// =====================================================================
+// DMA fire-and-forget transfer.  Caller manages CS via the cb (called
+// from the DMA-TC IRQ).  See spicmds.h for full semantics.
+// =====================================================================
+#if CONFIG_WANT_SPI_DMA
+// Board-level primitive — defined in stm32h7_spi.c.  Declared locally
+// with `void *` to avoid pulling stm32h7xx.h into this file.
+extern int spi_dma_kick_tx(void *spi, uint8_t *tx_buf, uint16_t len,
+                           spi_dma_done_fn cb, void *ctx);
+extern uint8_t spi_dma_is_inflight(void *spi);
+
+// At most one DMA can be in flight at a time (gated by spi_bus_busy).
+// We wrap the user callback so we own CS and bus_busy clearing — the
+// user cb only needs to know "transfer complete".
+static struct {
+    struct spidev_s *spi;
+    spi_dma_done_fn user_cb;
+    void *user_ctx;
+} active_dma_wrap;
+
+static void
+dma_wrap_done(void *ctx)
+{
+    (void)ctx;
+    struct spidev_s *spi = active_dma_wrap.spi;
+    spi_dma_done_fn user_cb = active_dma_wrap.user_cb;
+    void *user_ctx = active_dma_wrap.user_ctx;
+    active_dma_wrap.spi = NULL;
+    active_dma_wrap.user_cb = NULL;
+    active_dma_wrap.user_ctx = NULL;
+    if (spi && (spi->flags & SF_HAVE_PIN))
+        gpio_out_write(spi->pin, !(spi->flags & SF_CS_ACTIVE_HIGH));
+    spi_bus_busy = 0;
+    if (user_cb)
+        user_cb(user_ctx);
+}
+
+int
+spidev_kick_dma_tx(struct spidev_s *spi, uint8_t *tx_buf, uint16_t len,
+                   spi_dma_done_fn cb, void *ctx)
+{
+    uint_fast8_t flags = spi->flags;
+    if (!(flags & SF_HARDWARE))
+        return -1;  // DMA only available on hardware SPI buses
+    if (spi_bus_busy || spi_bus_hold)
+        return -1;
+    spi_bus_busy = 1;
+    active_dma_wrap.spi = spi;
+    active_dma_wrap.user_cb = cb;
+    active_dma_wrap.user_ctx = ctx;
+    spi_prepare(spi->spi_config);
+    if (flags & SF_HAVE_PIN)
+        gpio_out_write(spi->pin, !!(flags & SF_CS_ACTIVE_HIGH));
+    int rc = spi_dma_kick_tx(spi->spi_config.spi, tx_buf, len,
+                             dma_wrap_done, NULL);
+    if (rc != 0) {
+        if (flags & SF_HAVE_PIN)
+            gpio_out_write(spi->pin, !(flags & SF_CS_ACTIVE_HIGH));
+        active_dma_wrap.spi = NULL;
+        active_dma_wrap.user_cb = NULL;
+        active_dma_wrap.user_ctx = NULL;
+        spi_bus_busy = 0;
+    }
+    return rc;
+}
+
+uint8_t
+spidev_dma_in_flight(struct spidev_s *spi)
+{
+    return spi_dma_is_inflight(spi->spi_config.spi);
+}
+#else
+// Polled fallback: no DMA on this board.  spidev_kick_dma_tx becomes a
+// synchronous wrapper that calls spidev_transfer + cb immediately.
+// Phase stepping built without DMA degrades to legacy behavior.
+int
+spidev_kick_dma_tx(struct spidev_s *spi, uint8_t *tx_buf, uint16_t len,
+                   spi_dma_done_fn cb, void *ctx)
+{
+    uint_fast8_t flags = spi->flags;
+    if (spi_bus_busy || spi_bus_hold)
+        return -1;
+    spi_bus_busy = 1;
+    if (flags & SF_HAVE_PIN)
+        gpio_out_write(spi->pin, !!(flags & SF_CS_ACTIVE_HIGH));
+    spi_prepare(spi->spi_config);
+    spi_transfer(spi->spi_config, 0, (uint8_t)len, tx_buf);
+    if (flags & SF_HAVE_PIN)
+        gpio_out_write(spi->pin, !(flags & SF_CS_ACTIVE_HIGH));
+    spi_bus_busy = 0;
+    if (cb)
+        cb(ctx);
+    return 0;
+}
+
+uint8_t
+spidev_dma_in_flight(struct spidev_s *spi)
+{
+    (void)spi;
+    return 0;
+}
+#endif
+
 void
 spidev_transfer(struct spidev_s *spi, uint8_t receive_data
                 , uint8_t data_len, uint8_t *data)

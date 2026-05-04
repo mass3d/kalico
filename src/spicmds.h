@@ -18,4 +18,13 @@ void spidev_prepare_bus(struct spidev_s *spi);
 void spidev_transfer_prepared(struct spidev_s *spi, uint8_t data_len,
                               uint8_t *data);
 
+// DMA fire-and-forget transfer.  Caller manages CS via the cb (called
+// from the DMA-TC IRQ, ISR-context).  tx_buf MUST be in DMA-reachable
+// memory — on STM32H7 use the .dma_buf section attribute (DTCM at
+// 0x20000000 is CPU-private and unreachable by DMA1).
+typedef void (*spi_dma_done_fn)(void *ctx);
+int  spidev_kick_dma_tx(struct spidev_s *spi, uint8_t *tx_buf, uint16_t len,
+                        spi_dma_done_fn cb, void *ctx);
+uint8_t spidev_dma_in_flight(struct spidev_s *spi);
+
 #endif // spicmds.h

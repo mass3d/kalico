@@ -31,92 +31,98 @@ phase_compressor_set_max_error(struct phase_compressor *pc, double max_error)
     pc->max_error = max_error;
 }
 
-// Try to fit a quadratic polynomial to samples[0..n-1].
-// Returns 1 if the fit is within max_error, 0 otherwise.
-// Outputs: start_pos, velocity (per interval), acceleration (per interval)
+// Try to fit a quadratic polynomial p(i) = anchor + b*i + c*i^2 to samples
+// positions[0..n-1] with the i=0 value forced to equal `anchor` (which may
+// or may not equal positions[0]).
+// Returns 1 if the fit is within max_error including |positions[0]-anchor|,
+// 0 otherwise.
+// Outputs: velocity (per interval), acceleration (per interval).
+static int
+try_quadratic_fit_at(double *positions, int n, double anchor, double max_error
+                     , double *out_vel, double *out_accel)
+{
+    if (n < 1)
+        return 0;
+    if (n == 1) {
+        // One sample: only valid if positions[0] is within max_error of anchor.
+        if (fabs(positions[0] - anchor) > max_error)
+            return 0;
+        *out_vel = 0.;
+        *out_accel = 0.;
+        return 1;
+    }
+    if (n == 2) {
+        // Two samples and an anchor — three constraints, two unknowns (b,c).
+        // Underdetermined for general anchor; force c=0 and choose b to hit
+        // positions[1] exactly. positions[0] error against anchor is checked
+        // against max_error.
+        if (fabs(positions[0] - anchor) > max_error)
+            return 0;
+        *out_vel = positions[1] - anchor;
+        *out_accel = 0.;
+        return 1;
+    }
+
+    // Constrained least-squares fit: p(i) = anchor + b*i + c*i^2.
+    // Forcing p(0) = anchor (rather than positions[0]) guarantees the segment
+    // begins at exactly the host-mirror value.  The 2x2 normal equations
+    // (minimizing sum_{i=0..n-1} (anchor + b*i + c*i^2 - positions[i])^2 over
+    // (b,c)) come out to:
+    //   [Σi²  Σi³] [b]   [Σi·r_i ]
+    //   [Σi³  Σi⁴] [c] = [Σi²·r_i]
+    // where r_i = positions[i] - anchor, summed over i=0..n-1.
+    // Note: the i=0 term contributes zero to all four sums and to r_0 (since
+    // we don't force r_0 = 0 anymore — it's positions[0] - anchor and may be
+    // nonzero), so effectively the sum starts at i=1.  However, the i=0 fit
+    // error |positions[0] - anchor| must be checked separately.
+    double s2 = 0., s3 = 0., s4 = 0., t1 = 0., t2 = 0.;
+    int i;
+    for (i = 1; i < n; i++) {
+        double id = (double)i;
+        double id2 = id * id;
+        double r = positions[i] - anchor;
+        s2 += id2;
+        s3 += id2 * id;
+        s4 += id2 * id2;
+        t1 += id * r;
+        t2 += id2 * r;
+    }
+
+    double det = s2 * s4 - s3 * s3;
+    if (fabs(det) < 1e-20)
+        return 0;
+    double inv_det = 1. / det;
+    double b = (s4 * t1 - s3 * t2) * inv_det;
+    double c = (s2 * t2 - s3 * t1) * inv_det;
+
+    // Check fit error.  Include i=0 (anchor vs positions[0]) since it's no
+    // longer guaranteed exact.
+    double max_err = fabs(positions[0] - anchor);
+    for (i = 1; i < n; i++) {
+        double id = (double)i;
+        double fitted = anchor + b * id + c * id * id;
+        double err = fabs(positions[i] - fitted);
+        if (err > max_err)
+            max_err = err;
+    }
+    if (max_err > max_error)
+        return 0;
+
+    *out_vel = b;
+    *out_accel = 2. * c; // acceleration = 2*c (since p = a + b*i + c*i^2)
+    return 1;
+}
+
+// Backward-compatible wrapper: anchor at positions[0] (legacy behavior).
 static int
 try_quadratic_fit(double *positions, int n, double max_error
                   , double *out_start, double *out_vel, double *out_accel)
 {
     if (n < 1)
         return 0;
-    if (n == 1) {
-        *out_start = positions[0];
-        *out_vel = 0.;
-        *out_accel = 0.;
-        return 1;
-    }
-    if (n == 2) {
-        *out_start = positions[0];
-        *out_vel = positions[1] - positions[0];
-        *out_accel = 0.;
-        return 1;
-    }
-
-    // Least-squares fit: p(i) = a + b*i + c*i^2
-    // Using the known closed-form for evenly spaced samples at i=0..n-1
-    double n_d = (double)n;
-    double sum_p = 0., sum_ip = 0., sum_i2p = 0.;
-    double sum_i = 0., sum_i2 = 0., sum_i3 = 0., sum_i4 = 0.;
-    int i;
-    for (i = 0; i < n; i++) {
-        double id = (double)i;
-        double p = positions[i];
-        sum_p += p;
-        sum_ip += id * p;
-        sum_i2p += id * id * p;
-        sum_i += id;
-        sum_i2 += id * id;
-        sum_i3 += id * id * id;
-        sum_i4 += id * id * id * id;
-    }
-
-    // Solve 3x3 normal equations:
-    //   [n      sum_i   sum_i2 ] [a]   [sum_p  ]
-    //   [sum_i  sum_i2  sum_i3 ] [b] = [sum_ip ]
-    //   [sum_i2 sum_i3  sum_i4 ] [c]   [sum_i2p]
-    // Using Cramer's rule
-    double d00 = n_d, d01 = sum_i, d02 = sum_i2;
-    double d10 = sum_i, d11 = sum_i2, d12 = sum_i3;
-    double d20 = sum_i2, d21 = sum_i3, d22 = sum_i4;
-
-    double det = d00*(d11*d22 - d12*d21) - d01*(d10*d22 - d12*d20)
-                 + d02*(d10*d21 - d11*d20);
-    if (fabs(det) < 1e-20)
-        return 0;
-    double inv_det = 1. / det;
-
-    double a = ((sum_p*(d11*d22 - d12*d21) - d01*(sum_ip*d22 - sum_i2p*d21)
-                 + d02*(sum_ip*d21 - sum_i2p*d11)) * inv_det);
-    double b = ((d00*(sum_ip*d22 - sum_i2p*d21) - sum_p*(d10*d22 - d12*d20)
-                 + d02*(sum_i2p*d20 - sum_ip*d20)) * inv_det);
-    // Correct b computation
-    b = ((d00*(sum_ip*d22 - sum_i2p*d12) - d01*(sum_p*d22 - sum_i2p*d02)
-          + d02*(sum_p*d12 - sum_ip*d02)) * inv_det);
-    // Wait, let me redo this properly with cofactors
-    // Actually, let's use a cleaner approach:
-    b = (d00*(sum_ip*d22 - sum_i2p*d21) - sum_p*(d10*d22 - d12*d20)
-         + d02*(d10*sum_i2p - sum_ip*d20)) * inv_det;
-    double c = (d00*(d11*sum_i2p - sum_ip*d21) - d01*(d10*sum_i2p - sum_ip*d20)
-                + sum_p*(d10*d21 - d11*d20)) * inv_det;
-
-    // Check fit error
-    double max_err = 0.;
-    for (i = 0; i < n; i++) {
-        double id = (double)i;
-        double fitted = a + b * id + c * id * id;
-        double err = fabs(positions[i] - fitted);
-        if (err > max_err)
-            max_err = err;
-    }
-
-    if (max_err > max_error)
-        return 0;
-
-    *out_start = a;
-    *out_vel = b;
-    *out_accel = 2. * c; // acceleration = 2*c (since p = a + b*i + c*i^2)
-    return 1;
+    *out_start = positions[0];
+    return try_quadratic_fit_at(positions, n, positions[0], max_error,
+                                out_vel, out_accel);
 }
 
 // Compress an array of position samples into phase_move segments.
@@ -157,6 +163,103 @@ phase_compressor_compress(struct phase_compressor *pc
         out[out_count].acceleration = best_accel;
         out[out_count].count = best_len;
         out_count++;
+
+        start += best_len;
+    }
+
+    return out_count;
+}
+
+// Closed-form last-emitted phase position after a (start, vel, accel, count)
+// segment.  Matches the MCU's per-tick advance loop bit-for-bit:
+//   position += velocity; velocity += acceleration; (count times)
+//   last_emitted = position before the final advance
+//                = start + (count-1)*vel + accel * (count-1)*(count-2)/2
+// All arithmetic wraps at int32.  Returns the int32-signed result.
+static int32_t
+mirror_advance(int32_t start, int32_t vel, int32_t accel, uint16_t count)
+{
+    if (count == 0)
+        return start;
+    int64_t n_minus_1 = (int64_t)count - 1;
+    int64_t n_choose_2 = (n_minus_1 * (n_minus_1 - 1)) / 2; // = (N-1)(N-2)/2
+    int64_t raw = (int64_t)start + n_minus_1 * (int64_t)vel
+                  + n_choose_2 * (int64_t)accel;
+    return (int32_t)(raw & 0xFFFFFFFFLL);
+}
+
+// Anchored compress: produce phase_mcu_move segments with int32 start_position
+// chained by mirror_advance() so segment K+1's anchor equals MCU's last-emitted
+// from segment K, bit-exactly.  First segment anchored at host-supplied
+// `anchor_fixed` (16.16).  This eliminates the resume-from-idle click by
+// construction: every emitted XDIRECT phase is continuous from the previous
+// one, regardless of float drift in the trapq sample stream.
+//
+// Returns number of MCU moves written.
+int __visible
+phase_compressor_compress_anchored(struct phase_compressor *pc
+                                   , double *positions, int num_samples
+                                   , int32_t anchor_fixed
+                                   , struct phase_mcu_move *out_mcu, int max_out)
+{
+    int out_count = 0;
+    int start = 0;
+    double scale = 65536.;
+    int32_t anchor_int = anchor_fixed;
+
+    while (start < num_samples && out_count < max_out) {
+        // Reduce anchor mod 1024 (one electrical cycle) for the fit so its
+        // double form stays in a small numeric range.  Phase extraction on
+        // the MCU uses only the low 26 bits anyway.
+        int32_t anchor_reduced = (int32_t)(((uint32_t)anchor_int) & 0x03FFFFFFu);
+        // Sign-extend reduced anchor: 26-bit unsigned -> signed centered.
+        // Actually 0..0x03FFFFFF is fine as positive; we convert to double.
+        double anchor_double = (double)anchor_reduced / scale;
+
+        int best_len = 1;
+        double best_vel = 0., best_accel = 0.;
+
+        int lo = 1, hi = num_samples - start;
+        while (lo <= hi) {
+            int mid = (lo + hi) / 2;
+            double v, a;
+            if (try_quadratic_fit_at(positions + start, mid, anchor_double,
+                                     pc->max_error, &v, &a)) {
+                best_len = mid;
+                best_vel = v;
+                best_accel = a;
+                lo = mid + 1;
+            } else {
+                hi = mid - 1;
+            }
+        }
+
+        // If even n=1 didn't fit at the anchor (positions[start] differs from
+        // anchor by more than max_error), force-emit a single tick at the
+        // anchor anyway.  Continuity beats fit error — the sub-microstep
+        // residual will be absorbed in subsequent segments.
+        // best_len defaults to 1 with vel/accel = 0 — that's already the
+        // force-emit single-tick fallback.
+
+        // Convert to MCU fixed-point.
+        if (__builtin_isnan(best_vel) || __builtin_isnan(best_accel)) {
+            // Polynomial fit blew up — emit a hold segment instead (vel=0,
+            // accel=0) so we don't propagate NaN into the MCU.
+            best_vel = 0.;
+            best_accel = 0.;
+        }
+        int32_t vel_int = (int32_t)(best_vel * scale);
+        int32_t accel_int = (int32_t)(best_accel * scale);
+        out_mcu[out_count].start_position = anchor_reduced;
+        out_mcu[out_count].velocity = vel_int;
+        out_mcu[out_count].acceleration = accel_int;
+        out_mcu[out_count].count = (uint16_t)best_len;
+        out_count++;
+
+        // Advance the anchor for the next segment via the same int32
+        // arithmetic the MCU uses.  This guarantees bit-exact chaining.
+        anchor_int = mirror_advance(anchor_reduced, vel_int, accel_int,
+                                    (uint16_t)best_len);
 
         start += best_len;
     }

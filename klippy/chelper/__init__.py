@@ -298,6 +298,11 @@ defs_phase_compress = """
     int phase_compressor_to_fixed(struct phase_compressed_move *segments
         , int num_segments
         , struct phase_mcu_move *out_mcu, int max_out);
+
+    int phase_compressor_compress_anchored(struct phase_compressor *pc
+        , double *positions, int num_samples
+        , int32_t anchor_fixed
+        , struct phase_mcu_move *out_mcu, int max_out);
 """
 
 defs_std = """
