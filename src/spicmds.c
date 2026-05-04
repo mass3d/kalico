@@ -225,24 +225,21 @@ spidev_dma_in_flight(struct spidev_s *spi)
     return spi_dma_is_inflight(spi->spi_config.spi);
 }
 #else
-// Polled fallback: no DMA on this board.  spidev_kick_dma_tx becomes a
-// synchronous wrapper that calls spidev_transfer + cb immediately.
-// Phase stepping built without DMA degrades to legacy behavior.
+// Polled fallback: no DMA on this board.  Defer to `spidev_transfer`,
+// the exact same code path as `command_spi_send` (and therefore the
+// same path Klipper's standard TMC register writes use).  The earlier
+// hand-rolled implementation duplicated that logic but had subtle
+// differences (CS ordering, no SF_HARDWARE/SF_SOFTWARE flag check)
+// that made phase-stepping per-tick bursts diverge from the proven
+// path — the `spidev_kick_dma_tx` writes would not land at the TMC
+// even though the SPI clock was driven.
 int
 spidev_kick_dma_tx(struct spidev_s *spi, uint8_t *tx_buf, uint16_t len,
                    spi_dma_done_fn cb, void *ctx)
 {
-    uint_fast8_t flags = spi->flags;
     if (spi_bus_busy || spi_bus_hold)
         return -1;
-    spi_bus_busy = 1;
-    if (flags & SF_HAVE_PIN)
-        gpio_out_write(spi->pin, !!(flags & SF_CS_ACTIVE_HIGH));
-    spi_prepare(spi->spi_config);
-    spi_transfer(spi->spi_config, 0, (uint8_t)len, tx_buf);
-    if (flags & SF_HAVE_PIN)
-        gpio_out_write(spi->pin, !(flags & SF_CS_ACTIVE_HIGH));
-    spi_bus_busy = 0;
+    spidev_transfer(spi, 0, (uint8_t)len, tx_buf);
     if (cb)
         cb(ctx);
     return 0;

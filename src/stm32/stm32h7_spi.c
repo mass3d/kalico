@@ -247,10 +247,16 @@ spi_dma_handle_tc(struct spi_dma_state *st, volatile uint32_t *clear_reg,
     *clear_reg = clear_mask;
     st->stream->CR &= ~DMA_SxCR_EN;
     SPI_TypeDef *spi = st->spi;
-    // Wait for trailing SCLK edge.  EOT typically asserts within a few
-    // cycles of DMA TC because the SPI peripheral has finished shifting
-    // by the time DMA reports complete.
-    uint32_t deadline = timer_read_time() + timer_from_us(2);
+    // Wait for trailing SCLK edge.  DMA TC fires when DMA finishes
+    // PUSHING bytes to the TX FIFO — but the SPI peripheral is still
+    // shifting those bytes out at the SCK rate.  EOT only asserts after
+    // the last bit is fully shifted.  At 4 MHz, 5 bytes take 10us to
+    // shift out; the previous 2us timeout was not nearly enough, so
+    // SPE got cleared mid-transfer — clearing SPE truncates the burst at
+    // the next byte boundary, and the TMC saw a short/garbled write and
+    // ignored it.  100us covers 5-byte bursts down to 400 kHz SPI; well
+    // under any realistic interval at any update rate.
+    uint32_t deadline = timer_read_time() + timer_from_us(100);
     while ((spi->SR & SPI_SR_EOT) == 0
            && timer_is_before(timer_read_time(), deadline))
         ;
@@ -396,6 +402,14 @@ spi_dma_kick_tx(void *spi_void, uint8_t *tx_buf, uint16_t len,
     st->ctx = ctx;
 
     // Program the DMA stream with the new buffer + length.
+    // STM32H7 has D-cache enabled (see stm32h7.c init), and the .dma_buf
+    // section in D2 SRAM is cacheable by default.  Without flushing the
+    // cache here, the DMA reads stale memory (the CPU's recent byte
+    // writes still sit in the cache) and the SPI transmits old data —
+    // so the TMC's XDIRECT register never updates even though `write_count`
+    // climbs.  Clean the source range so the CPU's writes are visible to
+    // DMA before the stream pulls bytes.
+    SCB_CleanDCache_by_Addr((uint32_t *)tx_buf, len);
     DMA_Stream_TypeDef *stream = st->stream;
     stream->NDTR = len;
     stream->M0AR = (uint32_t)tx_buf;
