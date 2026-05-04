@@ -179,6 +179,23 @@ config HAVE_STM32_USBCANBUS
     depends on !MACH_STM32F1
     default y
 
+# Auxiliary DMA-coherent SRAM region.  STM32H7's RAM_START at 0x20000000 is
+# DTCM (CPU-private, NOT reachable by DMA1/DMA2).  Phase-stepping DMA TX
+# buffers must live in D2 SRAM at 0x30000000.  See src/generic/armcm_link.lds.S
+# for the section placement.
+config HAVE_DMA_BUF_REGION
+    bool
+    default y if MACH_STM32H7
+    default n
+config DMA_BUF_START
+    hex
+    default 0x30000000 if MACH_STM32H7
+    default 0
+config DMA_BUF_SIZE
+    hex
+    default 0x10000 if MACH_STM32H7   # 64 KB of D2 SRAM1 — plenty for SPI buffers
+    default 0
+
 config MCU
     string
     default "stm32f031x6" if MACH_STM32F031

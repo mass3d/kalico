@@ -45,7 +45,11 @@ def _decode_xdirect(raw):
 
 
 def _decode_mscuract(raw):
-    # TMC5160 datasheet: MSCURACT bit 8..0 is CUR_B, bit 24..16 is CUR_A.
+    # MSCURACT raw layout per datasheet: bits 0..8 = CUR_A, bits 16..24 = CUR_B.
+    # We return them swapped so the (cur_a, cur_b) tuple matches what we write
+    # to XDIRECT below — XDIRECT in direct_mode swaps coils relative to MSCURACT
+    # (Prusa documents this as "TMC in Xdirect mode swaps coils"). The labels
+    # here track XDIRECT's coil mapping, not MSCURACT's bit layout.
     return _sign9(raw >> 16), _sign9(raw)
 
 
@@ -110,22 +114,10 @@ class MCU_phase_stepper:
         self.name = config.get_name()
         self.mcu = stepper.get_mcu()
         self.oid = self.mcu.create_oid()
-        self.update_rate = config.getfloat('phase_update_rate', 10000.,
+        self.update_rate = config.getfloat('phase_update_rate', 25000.,
                                            above=1000., maxval=50000.)
         self.update_interval = 1. / self.update_rate
-        self.bus_slots = config.getint('phase_bus_slots', 0,
-                                       minval=0, maxval=4)
-        self.bus_slot = config.getint('phase_bus_slot', -1,
-                                      minval=-1, maxval=3)
-        max_idle_lookback = (MAX_PHASE_SAMPLES - 1) * self.update_interval
-        self.idle_lookback = min(
-            config.getfloat('phase_idle_lookback', 0.5, minval=0.0),
-            max_idle_lookback)
-        self.resume_lookback = min(
-            config.getfloat('phase_resume_lookback', 2.0, minval=0.0),
-            max_idle_lookback)
-        self.idle_hold_time = config.getfloat(
-            'phase_idle_hold_time', 1.0, minval=0.0)
+        self.phase_bus = config.getint('phase_bus', 0, minval=0, maxval=3)
         self.active_tpowerdown = config.getint(
             'phase_active_tpowerdown', PHASE_ACTIVE_TPOWERDOWN,
             minval=0, maxval=255)
@@ -136,11 +128,18 @@ class MCU_phase_stepper:
         self._phase_direction_override = config.getint(
             'phase_direction_override', 0, minval=-1, maxval=1)
         self._phase_stepping_active = False
-        self._mcu_hold_active = False
         self._needs_clock_reset = True
-        self._expected_end_clock = 0
-        self._idle_position = None
-        self._idle_start_time = None
+        # Bit-exact mirror of the MCU's last-emitted phase position (16.16
+        # int32).  Every compressed segment's start_position is FORCED to
+        # equal this anchor — that's what makes the resume-from-idle click
+        # impossible by construction.  Updated locally using mirror_advance
+        # math identical to the MCU loop, so flush-to-flush continuity is
+        # bit-exact.
+        self._mcu_anchor_pos = 0
+        self._mcu_anchor_clock = 0
+        # AWD pair partnership (set by TMCPhaseStepping._resolve_pairs).
+        self._pair_partner = None
+        self._pair_reset_consumed_clock = None
         self._invalid_flush_count = 0
         self._faulted = False
         self._fault_handler = None
@@ -151,11 +150,16 @@ class MCU_phase_stepper:
         self._phase_offset = 0.0
         self._last_commanded_position = None
         self._activation_pending = False
-        self._stagger_ticks = 0
         self._trace_events = []
         self._activation_vector = {}
-        self._last_idle_vector = {}
         self._last_continuity = {}
+        # Saved TMCCommandHelper methods replaced while phase stepping is
+        # active. The cmdhelper isn't stored on the TMC5160 instance — we
+        # find it via the stepper_enable callback list during activate().
+        # Restored in deactivate().
+        self._tmc_cmd_helper = None
+        self._saved_tmc_do_disable = None
+        self._saved_tmc_do_enable = None
         # FFI handles
         ffi_main, ffi_lib = chelper.get_ffi()
         self._ffi_main = ffi_main
@@ -175,7 +179,7 @@ class MCU_phase_stepper:
                                        MAX_PHASE_SEGMENTS)
         # MCU command handles (filled during _build_config)
         self._queue_cmd = self._reset_cmd = self._set_current_cmd = None
-        self._set_slot_cmd = None
+        self._reset_group_cmd = None
         self._stop_cmd = None
         self.mcu.register_config_callback(self._build_config)
         self.printer.register_event_handler('klippy:connect',
@@ -199,10 +203,10 @@ class MCU_phase_stepper:
             " velocity=%i accel=%i count=%hu")
         self._reset_cmd = self.mcu.lookup_command(
             "reset_phase_clock oid=%c clock=%u")
+        self._reset_group_cmd = self.mcu.lookup_command(
+            "reset_phase_clock_group oids=%*s clock=%u")
         self._set_current_cmd = self.mcu.lookup_command(
             "set_phase_stepper_current oid=%c scale=%hu")
-        self._set_slot_cmd = self.mcu.lookup_command(
-            "set_phase_stepper_slot oid=%c slot=%c slot_count=%c")
         self._stop_cmd = self.mcu.lookup_command(
             "stop_phase_stepper oid=%c")
         self._status_cmd = self.mcu.lookup_query_command(
@@ -210,18 +214,18 @@ class MCU_phase_stepper:
             "phase_stepper_status oid=%c event_count=%u write_count=%u"
             " skip_count=%u last_phase=%hu position=%i",
             oid=self.oid)
+        # Tell the MCU which bus_group this motor belongs to.  Default is
+        # buses[0]; multi-bus setups (future custom board) override per
+        # stepper.
+        if self.phase_bus != 0:
+            self.mcu.add_config_cmd(
+                "config_phase_bus oid=%d bus_index=%d"
+                % (self.oid, self.phase_bus))
     def get_mcu_status(self):
         """Query MCU-side ISR diagnostic counters."""
         if self._status_cmd is None:
             return None
         return self._status_cmd.send([self.oid])
-    def set_bus_slot(self, slot, slot_count):
-        if self._set_slot_cmd is None:
-            return
-        self._set_slot_cmd.send([self.oid, slot, slot_count])
-        self.bus_slot = slot
-        self.bus_slots = slot_count
-        self._trace_event('bus_slot', slot=slot, slot_count=slot_count)
     def _resolve_phase_direction(self, invert_dir):
         if self._phase_direction_override:
             direction = 1.0 if self._phase_direction_override > 0 else -1.0
@@ -283,26 +287,15 @@ class MCU_phase_stepper:
         logging.warning("Phase stepping fault on %s: %s", self.name, reason)
         if self._fault_handler is not None:
             self._fault_handler(self.name, reason)
-    def activate(self, stagger_ticks=0):
-        """Enable XDIRECT mode on TMC5160 and start phase stepping."""
-        self._stagger_ticks = stagger_ticks
-        if self._phase_stepping_active:
-            return
-        if self._queue_cmd is None or self.tmc_obj is None:
-            logging.warning("Phase stepping not available for %s"
-                            " (MCU commands not configured)", self.name)
-            return
+    def _apply_phase_stepping_registers(self):
+        """Write the TMC register block needed for phase stepping mode.
+        Used both at initial activate() and from the patched _do_enable
+        path so a post-M84 motor_enable re-establishes direct_mode.
+        Returns (mscnt, mscuract_raw, cur_a, cur_b, preload_source) so the
+        caller can log/trace the preload state."""
         mcu_tmc = self.tmc_obj.mcu_tmc
-        # Re-initialize key TMC registers from config cache.
-        # TMC5160 may have reset during homing (undervoltage from back-EMF).
         fields = mcu_tmc.fields
         cached_ihr = fields.registers.get("IHOLD_IRUN", 0)
-        # Get configured microstep resolution for position scaling.
-        # Klipper step_dist maps to configured microsteps (e.g. 16/full step),
-        # but MSCNT uses 256 native microsteps per full step.  We need the
-        # ratio to convert positions to MSCNT units.
-        mres = fields.get_field("mres")
-        microsteps = 256 >> mres  # mres=4 -> 16, mres=0 -> 256
         for reg_name in ["GLOBALSCALER", "CHOPCONF"]:
             val = fields.registers.get(reg_name, None)
             if val is not None:
@@ -318,21 +311,14 @@ class MCU_phase_stepper:
         # STEP/DIR, so we extend the standstill timeout and disable fast
         # standstill detection while active instead of relying on defaults.
         mcu_tmc.set_register("TPOWERDOWN", self.active_tpowerdown)
-        chop_rb = mcu_tmc.get_register("CHOPCONF")
-        logging.info("Phase stepping %s: reinit CHOPCONF=0x%08x",
-                     self.name, chop_rb)
         # Read the live phase/current state before enabling direct_mode so the
         # handoff preserves the actual electrical hold, not an inferred one.
         mscnt = mcu_tmc.get_register("MSCNT") & 0x3FF
         mscuract_raw = mcu_tmc.get_register("MSCURACT")
-        live_cur_a, live_cur_b = _decode_mscuract(mscuract_raw)
         cur_a, cur_b, preload_source = _activation_preload_currents(
             mscnt, mscuract_raw)
-        # Save original GCONF, then enable direct_mode with SpreadCycle.
-        # TMC5160 datasheet: SpreadCycle gives direct chopper control in
-        # direct_mode.  StealthChop's auto-regulation can't track at 10kHz
-        # and falls back to MSLUT — must use SpreadCycle (en_pwm_mode=0).
-        self._saved_gconf = mcu_tmc.get_register("GCONF")
+        # GCONF: direct_mode=1, SpreadCycle (en_pwm_mode=0).  StealthChop's
+        # auto-regulation can't track at 10kHz and falls back to MSLUT.
         gconf_val = self._saved_gconf
         gconf_val |= (1 << 16)   # direct_mode
         gconf_val &= ~(1 << 2)   # SpreadCycle (clear en_pwm_mode)
@@ -347,17 +333,146 @@ class MCU_phase_stepper:
         mcu_tmc.set_register("XTARGET", (cur_b_u16 << 16) | cur_a_u16)
         # Set current scale (256 = no scaling, table peak 248 passes through)
         self._set_current_cmd.send([self.oid, 256])
+        return mscnt, mscuract_raw, cur_a, cur_b, preload_source
+    def _ramp_xdirect_to_mscnt(self, print_time):
+        """Ramp XDIRECT one MSCNT microstep at a time toward the TMC's
+        current MSCNT phase. When deactivate() then clears GCONF.direct_mode,
+        the TMC reverts to MSLUT-driven currents based on MSCNT (which has
+        been frozen at activation time). Without alignment, the held XDIRECT
+        phase and MSCNT phase differ -> motor jumps electrically -> click.
+        Ramp uses fire-and-forget spi_send with minclock spacing so the
+        host returns in O(host scheduling) instead of waiting for n_steps
+        SPI verifications."""
+        mcu_tmc = self.tmc_obj.mcu_tmc
+        try:
+            mscnt = mcu_tmc.get_register("MSCNT") & 0x3FF
+            xdirect_raw = mcu_tmc.get_register("XTARGET")
+        except Exception:
+            logging.exception(
+                "Phase stepping %s: deactivate ramp register read failed",
+                self.name)
+            return print_time
+        xd_a, xd_b = _decode_xdirect(xdirect_raw)
+        cur_phase = _phase_from_currents(xd_a, xd_b)
+        if cur_phase is None:
+            self._trace_event('deactivate_ramp_skip', mscnt=mscnt,
+                              reason='no_xdirect_phase')
+            return print_time
+        delta = _phase_delta(cur_phase, mscnt)
+        if delta is None or delta == 0:
+            self._trace_event('deactivate_ramp_skip', mscnt=mscnt,
+                              cur_phase=cur_phase, reason='aligned')
+            return print_time
+        tmc_spi = mcu_tmc.tmc_spi
+        spi = tmc_spi.spi
+        chain_pos = mcu_tmc.chain_pos
+        reg = mcu_tmc.name_to_reg["XTARGET"]
+        step = 1 if delta > 0 else -1
+        n_steps = abs(delta)
+        ramp_dt = self.update_interval
+        phase = cur_phase
+        ramp_pt = print_time
+        for _ in range(n_steps):
+            phase = (phase + step) & 0x3FF
+            cur_a, cur_b = _phase_table_currents(phase)
+            val = ((cur_b & 0xFFFF) << 16) | (cur_a & 0xFFFF)
+            data = [
+                (reg | 0x80) & 0xFF,
+                (val >> 24) & 0xFF,
+                (val >> 16) & 0xFF,
+                (val >> 8) & 0xFF,
+                val & 0xFF,
+            ]
+            cmd = tmc_spi._build_cmd(data, chain_pos)
+            ramp_pt += ramp_dt
+            minclock = spi.get_mcu().print_time_to_clock(ramp_pt)
+            spi.spi_send(cmd, minclock=minclock)
+        self._trace_event('deactivate_ramp', mscnt=mscnt,
+                          start_phase=cur_phase, end_phase=mscnt,
+                          n_steps=n_steps, ramp_end=ramp_pt)
+        logging.info(
+            "Phase stepping %s: deactivate ramp from phase=%d to mscnt=%d"
+            " in %d steps (%.3fms), ramp_end_print_time=%.6f",
+            self.name, cur_phase, mscnt, n_steps,
+            n_steps * ramp_dt * 1000.0, ramp_pt)
+        return ramp_pt
+    def _find_tmc_cmd_helper(self):
+        """The TMC5160 class instantiates TMCCommandHelper as a local
+        variable and discards the reference, so we can't reach it
+        directly via self.tmc_obj. The cmdhelper does register itself
+        with the stepper's enable_line via register_state_callback, so
+        we walk that callback list looking for a bound method whose
+        owner has both _do_disable and _do_enable (the TMC enable hooks)."""
+        try:
+            stepper_enable = self.printer.lookup_object('stepper_enable')
+            enable_line = stepper_enable.lookup_enable(self.stepper.get_name())
+        except Exception:
+            return None
+        for cb in getattr(enable_line, 'callbacks', []):
+            owner = getattr(cb, '__self__', None)
+            if owner is None:
+                continue
+            if (callable(getattr(owner, '_do_disable', None))
+                    and callable(getattr(owner, '_do_enable', None))):
+                return owner
+        return None
+    def _phase_aware_do_disable(self, print_time):
+        # Suppress chopper-off (toff=0) while phase stepping is active so M84
+        # / idle_timeout doesn't drop coil current and click. The original
+        # _do_disable is restored in deactivate().
+        if self._phase_stepping_active:
+            return
+        if self._saved_tmc_do_disable is not None:
+            self._saved_tmc_do_disable(print_time)
+    def _phase_aware_do_enable(self, print_time):
+        # If something invokes _do_enable while phase stepping is still
+        # active (rare — active_callbacks are bypassed), re-establish our
+        # GCONF/CHOPCONF/XDIRECT state instead of letting _init_registers()
+        # clobber direct_mode.
+        if self._phase_stepping_active:
+            try:
+                self._apply_phase_stepping_registers()
+            except Exception:
+                logging.exception(
+                    "Phase stepping %s: failed to re-apply registers in"
+                    " patched _do_enable", self.name)
+            return
+        if self._saved_tmc_do_enable is not None:
+            self._saved_tmc_do_enable(print_time)
+    def activate(self):
+        """Enable XDIRECT mode on TMC5160 and start phase stepping."""
+        if self._phase_stepping_active:
+            return
+        if self._queue_cmd is None or self.tmc_obj is None:
+            logging.warning("Phase stepping not available for %s"
+                            " (MCU commands not configured)", self.name)
+            return
+        mcu_tmc = self.tmc_obj.mcu_tmc
+        # Re-initialize key TMC registers from config cache.
+        # TMC5160 may have reset during homing (undervoltage from back-EMF).
+        fields = mcu_tmc.fields
+        # Get configured microstep resolution for position scaling.
+        # Klipper step_dist maps to configured microsteps (e.g. 16/full step),
+        # but MSCNT uses 256 native microsteps per full step.  We need the
+        # ratio to convert positions to MSCNT units.
+        mres = fields.get_field("mres")
+        microsteps = 256 >> mres  # mres=4 -> 16, mres=0 -> 256
+        # Save original GCONF so we can restore it on deactivate and so the
+        # helper has a stable base to OR direct_mode onto.
+        self._saved_gconf = mcu_tmc.get_register("GCONF")
+        # Apply our register block (CHOPCONF/IHOLD_IRUN/TPOWERDOWN/GCONF/XTARGET)
+        mscnt, mscuract_raw, cur_a, cur_b, preload_source = (
+            self._apply_phase_stepping_registers())
+        live_cur_a, live_cur_b = _decode_mscuract(mscuract_raw)
+        chop_rb = mcu_tmc.get_register("CHOPCONF")
+        logging.info("Phase stepping %s: reinit CHOPCONF=0x%08x",
+                     self.name, chop_rb)
+        cur_b_u16 = cur_b & 0xFFFF
+        cur_a_u16 = cur_a & 0xFFFF
         self._needs_clock_reset = True
-        self._mcu_hold_active = False
         self._invalid_flush_count = 0
         self._faulted = False
-        self._idle_position = None
-        self._idle_start_time = None
-        # Reset per-movement logging counters so each new move gets logged
-        self._had_zero_samples = True  # will trigger fresh log on first data
-        self._move_log_count = 0
-        if not hasattr(self, '_total_log_count'):
-            self._total_log_count = 0
+        self._pair_reset_consumed_clock = None
         # Configure the phase generator with the stepper's kinematics.
         # Scale step_dist so positions are in MSCNT units (256 per full step)
         # rather than klipper microstep units (e.g. 16 per full step).
@@ -389,14 +504,28 @@ class MCU_phase_stepper:
         stepper_pos_mscnt = (self.stepper.get_commanded_position()
                              / step_dist * (256.0 / microsteps))
         klipper_phase = int(stepper_pos_mscnt * direction) & 0x3FF
-        phase_offset = float((mscnt - klipper_phase) & 0x3FF)
+        # Anchor phase = the phase the preloaded XDIRECT actually represents.
+        # Prefer the live MSCURACT-derived current vector; fall back to MSCNT
+        # if the live read yielded no information.
+        anchor_phase = _phase_from_currents(cur_a, cur_b)
+        if anchor_phase is None:
+            anchor_phase = mscnt
+        # phase_offset aligns the trapq's first sample (in microsteps,
+        # post-direction) so that sample[0] mod 1024 == anchor_phase. With
+        # this alignment the compressor's first segment fits cleanly at the
+        # anchor — no force-emit-single-tick fallback, no phase glitch.
+        phase_offset = float((anchor_phase - klipper_phase) & 0x3FF)
         self._phase_offset = phase_offset
         self._ffi_lib.phase_generator_set_offset(
             self._phase_generator, phase_offset)
         self._last_commanded_position = self.stepper.get_commanded_position()
-        self._ffi_lib.phase_generator_set_last_position(
-            self._phase_generator, stepper_pos_mscnt * direction
-            + phase_offset)
+        # 16.16 fixed-point representation of the held phase — the host-mirror
+        # of the MCU's expected next-tick phase position.  Every subsequent
+        # compressed segment's start_position will be FORCED to equal this
+        # value, eliminating the phase discontinuity that produced the
+        # resume-from-idle click.
+        self._mcu_anchor_pos = (int(anchor_phase) << 16) & 0x03FFFFFF
+        self._mcu_anchor_clock = 0  # set on first generate_and_queue
         self._trace_event('activate_begin',
                           mscnt=mscnt,
                           mscuract_a=live_cur_a,
@@ -424,7 +553,6 @@ class MCU_phase_stepper:
             'readback_delta': xdirect_delta,
             'gconf_shaft': gconf_shaft,
         }
-        self._last_idle_vector = {}
         self._last_continuity = {}
         self._trace_event('activate_preload',
                           preload_a=cur_a, preload_b=cur_b,
@@ -462,6 +590,37 @@ class MCU_phase_stepper:
             self.printer.get_reactor().monotonic())
         self._ffi_lib.phase_generator_set_time(
             self._phase_generator, current_print_time)
+        # Intercept M84/idle_timeout: replace TMCCommandHelper's
+        # _do_disable / _do_enable so the chopper stays on while phase
+        # stepping is active. The TMC5160 class doesn't store its
+        # cmdhelper, so we find it via the stepper_enable callback list
+        # (cmdhelper.register_state_callback() registered itself there).
+        # Restored in deactivate().
+        if self._saved_tmc_do_disable is None:
+            cmdhelper = self._find_tmc_cmd_helper()
+            if cmdhelper is not None:
+                self._tmc_cmd_helper = cmdhelper
+                self._saved_tmc_do_disable = cmdhelper._do_disable
+                self._saved_tmc_do_enable = cmdhelper._do_enable
+                cmdhelper._do_disable = self._phase_aware_do_disable
+                cmdhelper._do_enable = self._phase_aware_do_enable
+            else:
+                logging.warning(
+                    "Phase stepping %s: could not find TMCCommandHelper"
+                    " for %s; M84 / idle_timeout will turn off the chopper"
+                    " and click.", self.name, self.stepper.get_name())
+        try:
+            stepper_enable = self.printer.lookup_object('stepper_enable')
+            enable_line = stepper_enable.lookup_enable(self.stepper.get_name())
+            if enable_line.has_dedicated_enable():
+                logging.warning(
+                    "Phase stepping %s: stepper has a dedicated enable_pin."
+                    " M84 / idle_timeout will still de-energize the motor"
+                    " via the EN pin and click. Remove enable_pin from the"
+                    " [%s] config to use TMC virtual enable instead.",
+                    self.name, self.stepper.get_name())
+        except Exception:
+            pass
         # Suppress regular step/dir generation (TMC5160 ignores it in
         # direct_mode, and the ISR load would crash the MCU)
         self.stepper.set_phase_stepping(True)
@@ -474,106 +633,50 @@ class MCU_phase_stepper:
         if not self._phase_stepping_active:
             return
         self._phase_stepping_active = False
-        self._mcu_hold_active = False
         if self._stop_cmd is not None:
             self._stop_cmd.send([self.oid])
-    def _clear_idle_state(self):
-        self._idle_position = None
-        self._idle_start_time = None
-    def _recent_history_start(self, flush_time):
-        history = max(self.idle_lookback, self.resume_lookback)
-        if history <= 0.0:
-            return flush_time
-        return max(0.0, flush_time - history)
-    def _sampled_until(self, num_samples):
-        if num_samples <= 0:
-            return 0.0
-        return self._samples[num_samples - 1].time + self.update_interval
-    def _set_idle_boundary(self, flush_time, label='boundary'):
-        lookback = min(self.idle_lookback, flush_time)
-        boundary_time = flush_time - lookback
-        self._clear_idle_state()
-        self._expected_end_clock = 0
-        self._mcu_hold_active = False
-        self._needs_clock_reset = True
-        self._ffi_lib.phase_generator_set_time(
-            self._phase_generator, boundary_time)
-        self._trace_event('boundary', flush=flush_time,
-                          boundary=boundary_time, label=label)
-        return boundary_time
-    def _enter_idle_hold(self, flush_time, phase_position, label):
-        hold_phase, hold_a, hold_b = self._phase_vector_from_position(
-            phase_position)
-        self._last_idle_vector = {
-            'phase': hold_phase,
-            'a': hold_a,
-            'b': hold_b,
-            'flush': flush_time,
-            'label': label,
-        }
-        self._idle_position = phase_position
-        self._idle_start_time = flush_time
-        self._last_commanded_position = self._phase_to_commanded(phase_position)
-        self._expected_end_clock = 0
-        # Natural idle is continuous only after at least one MCU phase batch
-        # has actually run. Immediately after activation we may have only
-        # preloaded XDIRECT with no timer running yet, so the first real
-        # move still needs a reset_phase_clock anchor.
-        self._needs_clock_reset = not self._mcu_hold_active
-        self._ffi_lib.phase_generator_set_time(
-            self._phase_generator, flush_time)
-        self._ffi_lib.phase_generator_set_last_position(
-            self._phase_generator, phase_position)
-        self._trace_event('idle', flush=flush_time, pos=phase_position,
-                          label=label, reset=self._needs_clock_reset,
-                          mcu_hold=self._mcu_hold_active,
-                          hold_phase=hold_phase,
-                          hold_a=hold_a, hold_b=hold_b)
-        if not self._had_zero_samples:
-            self._had_zero_samples = True
-            logging.info("phase_gen %s: %s at flush=%.3f pos=%.1f"
-                         " (%s)",
-                         self.name, label, flush_time, phase_position,
-                         ("MCU idle hold active" if self._mcu_hold_active
-                          else "preloaded direct-mode idle"))
-    def _find_resume_window(self, num_samples, threshold):
-        idle_pos = self._idle_position
-        if idle_pos is None:
-            return None
-        last_match = None
-        for i in range(num_samples):
-            diff = self._positions[i] - idle_pos
-            if diff <= threshold and diff >= -threshold:
-                last_match = i
-                continue
-            if last_match is not None:
-                return (last_match, i)
-        if last_match is None:
-            return None
-        return (last_match, num_samples)
     def _phase_to_commanded(self, phase_pos):
         if self._phase_step_dist is None or not self._phase_direction:
             return None
         return ((phase_pos - self._phase_offset)
                 * self._phase_step_dist / self._phase_direction)
-    def _generate_samples(self, ffi_lib, flush_time):
-        num_samples = ffi_lib.phase_generator_generate(
-            self._phase_generator, flush_time,
-            self._samples, MAX_PHASE_SAMPLES)
-        if num_samples <= 0:
-            if not self._had_zero_samples:
-                self._had_zero_samples = True
-                logging.info("phase_gen %s: 0 samples at flush=%.3f"
-                             " (idle after %d move flushes)",
-                             self.name, flush_time, self._move_log_count)
-            ffi_lib.phase_generator_set_time(
-                self._phase_generator, flush_time)
-            return 0
-        num_samples = self._trim_nonfinite_edges(num_samples, flush_time)
-        if num_samples <= 0:
-            self._clear_idle_state()
-            return 0
-        return num_samples
+    def _advance_mirror(self, start, vel, accel, count):
+        """Closed-form last-emitted phase position after a (start, vel, accel,
+        count) segment.  Bit-exact match for the MCU's per-tick advance
+        (position += velocity; velocity += acceleration).  All arithmetic
+        wraps at int32, then result is reduced mod 1024<<16 (= 0x04000000)
+        so it fits the compressor's anchor convention."""
+        if count <= 0:
+            return start & 0x03FFFFFF
+        n_minus_1 = count - 1
+        n_choose_2 = (n_minus_1 * (n_minus_1 - 1)) // 2
+        raw = start + n_minus_1 * vel + n_choose_2 * accel
+        # Wrap to int32 signed first, then reduce mod 1024<<16 to match the
+        # compressor's reduced-anchor convention.
+        raw &= 0xFFFFFFFF
+        if raw & 0x80000000:
+            raw -= 0x100000000
+        return raw & 0x03FFFFFF
+    def _emit_reset_clock(self, clock):
+        """Pair-aware reset_phase_clock emit.  When this motor has a partner
+        (AWD), bundle both OIDs into a single MCU command so the partners'
+        waketimes are anchored atomically inside one irq_disable() window —
+        no host-ordering race can desync them."""
+        partner = self._pair_partner
+        if partner is not None and self._reset_group_cmd is not None:
+            if partner._pair_reset_consumed_clock != clock:
+                oids_bytes = bytearray([self.oid, partner.oid])
+                self._reset_group_cmd.send(
+                    [bytes(oids_bytes), clock])
+                self._pair_reset_consumed_clock = clock
+                partner._pair_reset_consumed_clock = clock
+                partner._needs_clock_reset = False
+                partner._mcu_anchor_clock = clock
+            else:
+                # Partner already covered this clock — skip.
+                pass
+        else:
+            self._reset_cmd.send([self.oid, clock])
     def deactivate(self, print_time=None):
         """Disable XDIRECT mode and return to step/dir."""
         # Stop MCU timer first (if not already stopped)
@@ -587,19 +690,25 @@ class MCU_phase_stepper:
         self._trace_event('deactivate_begin', print_time=print_time,
                           cmd_pos=cmd_pos)
         self.stepper.sync_commanded_position(print_time, cmd_pos)
-        self._clear_idle_state()
         self._activation_pending = False
-        self._mcu_hold_active = False
+        self._pair_reset_consumed_clock = None
         # Re-enable regular step/dir generation
         self.stepper.set_phase_stepping(False)
-        # Restore original GCONF and IHOLD_IRUN
+        # Ramp XDIRECT toward the TMC's frozen MSCNT phase before clearing
+        # direct_mode. Without alignment, clearing direct_mode reverts the
+        # driver to MSLUT-driven currents (CUR_A=sin(MSCNT), CUR_B=cos(MSCNT))
+        # and the held electrical phase snaps to MSCNT -> click.
+        ramp_end_pt = self._ramp_xdirect_to_mscnt(print_time)
+        # Restore original GCONF (clearing direct_mode) and IHOLD_IRUN.
+        # The GCONF write must happen AFTER the ramp commands; pass print_time
+        # so it's scheduled at the end of the ramp.
         mcu_tmc = self.tmc_obj.mcu_tmc
         if hasattr(self, '_saved_gconf'):
-            mcu_tmc.set_register("GCONF", self._saved_gconf)
+            mcu_tmc.set_register("GCONF", self._saved_gconf, ramp_end_pt)
         else:
             gconf_val = mcu_tmc.get_register("GCONF")
             gconf_val &= ~(1 << 16)
-            mcu_tmc.set_register("GCONF", gconf_val)
+            mcu_tmc.set_register("GCONF", gconf_val, ramp_end_pt)
         # Restore IHOLD_IRUN from config cache (not from TMC readback,
         # which may be 0 if the TMC reset during phase stepping)
         fields = mcu_tmc.fields
@@ -609,281 +718,110 @@ class MCU_phase_stepper:
         tpowerdown_cached = fields.registers.get("TPOWERDOWN", None)
         if tpowerdown_cached is not None:
             mcu_tmc.set_register("TPOWERDOWN", tpowerdown_cached)
+        # Restore TMCCommandHelper methods replaced during activate().
+        if (self._tmc_cmd_helper is not None
+                and self._saved_tmc_do_disable is not None):
+            self._tmc_cmd_helper._do_disable = self._saved_tmc_do_disable
+            self._saved_tmc_do_disable = None
+        if (self._tmc_cmd_helper is not None
+                and self._saved_tmc_do_enable is not None):
+            self._tmc_cmd_helper._do_enable = self._saved_tmc_do_enable
+            self._saved_tmc_do_enable = None
+        self._tmc_cmd_helper = None
         self._trace_event('deactivate_restore',
                           restored_gconf=hasattr(self, '_saved_gconf'),
                           restored_tpowerdown=tpowerdown_cached is not None,
                           restored_ihold=ihr_cached is not None)
         logging.info("Phase stepping deactivated for %s", self.name)
-    def _trim_nonfinite_edges(self, num_samples, flush_time):
-        start_idx = 0
-        end_idx = num_samples - 1
-        while (start_idx < num_samples
-               and not math.isfinite(self._samples[start_idx].position)):
-            start_idx += 1
-        while (end_idx >= start_idx
-               and not math.isfinite(self._samples[end_idx].position)):
-            end_idx -= 1
-        if start_idx > end_idx:
-            self._invalid_flush_count += 1
-            boundary_time = self._set_idle_boundary(
-                flush_time, label='all-nonfinite')
-            logging.info("phase_gen %s: all-nonfinite flush at %.3f"
-                         " (holding %.3fs lookback to %.3f invalid_flushes=%d)",
-                         self.name, flush_time,
-                         flush_time - boundary_time, boundary_time,
-                         self._invalid_flush_count)
-            if self._invalid_flush_count >= 4:
-                self._report_fault("repeated non-finite phase samples")
-            return 0
-        trimmed_prefix = start_idx
-        trimmed_suffix = num_samples - end_idx - 1
-        if not trimmed_prefix and not trimmed_suffix:
-            self._invalid_flush_count = 0
-            return num_samples
-        num_samples = end_idx - start_idx + 1
-        for j in range(num_samples):
-            self._samples[j] = self._samples[j + start_idx]
-        self._invalid_flush_count = 0
-        logging.info("phase_gen %s: trimmed non-finite samples"
-                     " prefix=%d suffix=%d flush=%.3f",
-                     self.name, trimmed_prefix, trimmed_suffix, flush_time)
-        return num_samples
     def generate_and_queue(self, flush_time):
-        """Called from the flush callback to generate phase moves."""
+        """Called from the flush callback.  Mirror-anchored continuous
+        emission: every flush produces a contiguous segment chain whose
+        first segment starts EXACTLY at the host-mirror of the MCU's last
+        emitted phase.  No idle/resume special case — when the kinematic
+        position doesn't change, the compressor produces a single segment
+        with vel=0, accel=0, count=N which the MCU writes as the same
+        XDIRECT bytes for N ticks.  No phase discontinuity at any segment
+        boundary, ever."""
         if not self._phase_stepping_active:
             return
         ffi_lib = self._ffi_lib
-        # Generate position samples
-        num_samples = self._generate_samples(ffi_lib, flush_time)
-        if num_samples <= 0:
+        # Sample positions for [last_flush_time .. flush_time].
+        n = ffi_lib.phase_generator_generate(
+            self._phase_generator, flush_time, self._samples,
+            MAX_PHASE_SAMPLES)
+        if n <= 0:
             return
+        # Extract into the float array; checks for NaN/inf.
         ret = ffi_lib.phase_generator_extract_positions(
-            self._samples, num_samples, self._positions)
-        first_pos = self._samples[0].position
-        last_pos = self._samples[num_samples - 1].position
+            self._samples, n, self._positions)
         if ret < 0:
-            # NaN or inf in position data — trapq returned invalid values.
+            # Non-finite samples from trapq.  Don't queue this flush; the
+            # next one should recover.  Fault if it persists.
             self._invalid_flush_count += 1
-            boundary_time = self._set_idle_boundary(
-                flush_time, label='invalid-samples')
-            logging.info("phase_gen %s: inf/NaN at flush=%.3f"
-                         " first_pos=%.3f last_pos=%.3f"
-                         " (holding %.3fs lookback to %.3f"
-                         " invalid_flushes=%d)",
-                         self.name, flush_time, first_pos, last_pos,
-                         flush_time - boundary_time, boundary_time,
-                         self._invalid_flush_count)
+            self._trace_event('invalid_flush', flush=flush_time,
+                              count=self._invalid_flush_count)
             if self._invalid_flush_count >= 4:
-                self._report_fault("repeated invalid phase samples")
+                self._report_fault("repeated non-finite phase samples")
             return
         self._invalid_flush_count = 0
-        if abs(last_pos - first_pos) < 0.5:
-            sampled_until = self._sampled_until(num_samples)
-            # A long idle gap can overflow the sample buffer. If we only
-            # inspect the oldest idle window and then jump straight to
-            # flush_time, we can skip an entire move that happened in the
-            # recent tail of that gap. Re-sample the most recent idle history
-            # window before declaring this flush pure standstill.
-            tail_start = self._recent_history_start(flush_time)
-            if (sampled_until + self.update_interval * 0.5 < flush_time
-                    and tail_start > self._samples[0].time
-                    + self.update_interval * 0.5):
-                self._trace_event('retry_idle_tail', flush=flush_time,
-                                  old_start=self._samples[0].time,
-                                  new_start=tail_start)
-                logging.info(
-                    "phase_gen %s: retrying recent idle tail"
-                    " old_start=%.3f new_start=%.3f flush=%.3f",
-                    self.name, self._samples[0].time,
-                    tail_start, flush_time)
-                ffi_lib.phase_generator_set_time(
-                    self._phase_generator, tail_start)
-                num_samples = self._generate_samples(ffi_lib, flush_time)
-                if num_samples <= 0:
-                    return
-                ret = ffi_lib.phase_generator_extract_positions(
-                    self._samples, num_samples, self._positions)
-                first_pos = self._samples[0].position
-                last_pos = self._samples[num_samples - 1].position
-                if ret < 0:
-                    boundary_time = self._set_idle_boundary(
-                        flush_time, label='retry-idle-invalid-samples')
-                    logging.info(
-                        "phase_gen %s: invalid samples after idle-tail retry"
-                        " at flush=%.3f (holding %.3fs lookback to %.3f)",
-                        self.name, flush_time,
-                        flush_time - boundary_time, boundary_time)
-                    return
-            if abs(last_pos - first_pos) < 0.5:
-                self._enter_idle_hold(flush_time, first_pos, 'standstill')
-                return
-        resuming_from_idle = self._idle_position is not None
-        resume_vector = (dict(self._last_idle_vector)
-                         if resuming_from_idle and self._last_idle_vector
-                         else None)
-        move_start = None
-        trim_start = None
-        retried_resume = False
-        while True:
-            if resuming_from_idle:
-                resume_window = self._find_resume_window(num_samples, 1.0)
-                if resume_window is not None:
-                    trim_start, move_start = resume_window
-                    break
-                if not retried_resume and self.resume_lookback > 0.0:
-                    retry_start = max(0.0, flush_time - self.resume_lookback)
-                    if (self._samples[0].time
-                            > retry_start + self.update_interval * 0.5):
-                        self._trace_event('retry_resume', flush=flush_time,
-                                          old_start=self._samples[0].time,
-                                          new_start=retry_start)
-                        logging.info(
-                            "phase_gen %s: retrying idle resume lookback"
-                            " old_start=%.3f new_start=%.3f flush=%.3f",
-                            self.name, self._samples[0].time,
-                            retry_start, flush_time)
-                        ffi_lib.phase_generator_set_time(
-                            self._phase_generator, retry_start)
-                        num_samples = self._generate_samples(
-                            ffi_lib, flush_time)
-                        if num_samples <= 0:
-                            return
-                        ret = ffi_lib.phase_generator_extract_positions(
-                            self._samples, num_samples, self._positions)
-                        first_pos = self._samples[0].position
-                        last_pos = self._samples[num_samples - 1].position
-                        if ret < 0:
-                            boundary_time = self._set_idle_boundary(
-                                flush_time, label='retry-invalid-samples')
-                            logging.info(
-                                "phase_gen %s: invalid samples after retry"
-                                " at flush=%.3f (holding %.3fs lookback to %.3f)",
-                                self.name, flush_time,
-                                flush_time - boundary_time, boundary_time)
-                            return
-                        retried_resume = True
-                        continue
-            move_start = ffi_lib.phase_generator_find_move_start(
-                self._positions, num_samples, 1.0)
-            trim_start = max(0, move_start - 1)
-            break
-        if move_start >= num_samples:
-            idle_pos = (self._idle_position if self._idle_position is not None
-                        else first_pos)
-            self._enter_idle_hold(flush_time, idle_pos, 'all-standstill flush')
-            return
-        if resuming_from_idle:
-            self._had_zero_samples = False
-            self._move_log_count = 0
-            # Force a clock reset so all motors on the same MCU start
-            # their first post-idle move at the same clock tick. Without
-            # this, each motor's ISR picks up queued moves independently,
-            # causing milliseconds of desync on CoreXY/AWD where belt
-            # partners must start simultaneously.
-            self._needs_clock_reset = True
-            self._trace_event('resume', flush=flush_time, trim=trim_start,
-                              move_start=move_start, first=first_pos,
-                              last=last_pos, retried=retried_resume)
-        self._clear_idle_state()
-        if trim_start > 0:
-            # Preserve one held-phase anchor sample on resume so the first MCU
-            # write matches the idle phase before motion begins.
-            num_samples -= trim_start
-            # Shift position data (C array, manual copy)
-            for j in range(num_samples):
-                self._positions[j] = self._positions[j + trim_start]
-            # Also update the samples array for correct start_time later
-            for j in range(num_samples):
-                self._samples[j] = self._samples[j + trim_start]
-        self._move_log_count += 1
-        self._total_log_count += 1
-        self._last_commanded_position = self._phase_to_commanded(
-            self._positions[num_samples - 1])
-        if self._move_log_count <= 5 or self._total_log_count % 100 == 0:
-            logging.info("phase_gen %s: samples=%d flush=%.3f first_pos=%.3f"
-                         " last_pos=%.3f clock_reset_flag=%s move_flush=%d",
-                         self.name, num_samples, flush_time,
-                         self._samples[0].position,
-                         self._samples[num_samples-1].position,
-                         self._needs_clock_reset, self._move_log_count)
-        # Compress into quadratic segments
-        num_segments = ffi_lib.phase_compressor_compress(
-            self._phase_compressor,
-            self._positions, num_samples,
-            self._segments, MAX_PHASE_SEGMENTS)
-        # Convert to fixed-point MCU format (C loop, replaces slow Python loop)
-        num_mcu = ffi_lib.phase_compressor_to_fixed(
-            self._segments, num_segments,
-            self._mcu_moves, MAX_PHASE_SEGMENTS)
+        # On the very first flush after activate, the mirror anchor was set
+        # to the preloaded XDIRECT phase but the anchor clock is 0 — set it
+        # now to the first sample's clock so reset_phase_clock points at the
+        # right tick.
+        start_time = self._samples[0].time
+        start_clock = self.mcu.print_time_to_clock(start_time)
+        if self._mcu_anchor_clock == 0:
+            self._mcu_anchor_clock = start_clock
+        # Compress with the mirror anchor.  The compressor forces the first
+        # segment's start_position to equal _mcu_anchor_pos and chains all
+        # subsequent segments via the same int32 mirror_advance arithmetic
+        # the MCU uses — guaranteeing bit-exact continuous phase emission.
+        num_mcu = ffi_lib.phase_compressor_compress_anchored(
+            self._phase_compressor, self._positions, n,
+            self._mcu_anchor_pos, self._mcu_moves, MAX_PHASE_SEGMENTS)
         if num_mcu <= 0:
-            boundary_time = self._set_idle_boundary(
-                flush_time, label='compress-empty')
-            logging.info("phase_gen %s: %d segments -> 0 MCU moves"
-                         " (holding %.3fs lookback to %.3f)",
-                         self.name, num_segments,
-                         flush_time - boundary_time, boundary_time)
             return
-        start_phase = _phase_from_mcu_start_position(
-            self._mcu_moves[0].start_position)
-        end_phase = _phase_position_to_mcu_phase(
-            self._positions[num_samples - 1])
+        # Issue reset_phase_clock on the very first emission post-activate.
+        # Continuous-emission means we never need to reset mid-print — the
+        # MCU ISR runs from activate to deactivate without stopping.
+        if self._needs_clock_reset:
+            self._emit_reset_clock(self._mcu_anchor_clock)
+            self._needs_clock_reset = False
+        # Emit segments and advance the host mirror.  After this loop the
+        # mirror equals the MCU's last-emitted phase, ready to anchor the
+        # next flush.
+        interval_ticks = self.mcu.seconds_to_clock(self.update_interval)
+        for i in range(num_mcu):
+            m = self._mcu_moves[i]
+            self._queue_cmd.send([self.oid, interval_ticks,
+                                  m.start_position, m.velocity,
+                                  m.acceleration, m.count])
+            self._mcu_anchor_pos = self._advance_mirror(
+                m.start_position, m.velocity, m.acceleration, m.count)
+            self._mcu_anchor_clock += m.count * interval_ticks
+        # Track commanded position for the deactivation handoff.
+        last_phase_pos = self._positions[n - 1]
+        self._last_commanded_position = self._phase_to_commanded(
+            last_phase_pos)
+        # Continuity logging for activation only (no idle resume in
+        # continuous-emission model).
         if self._activation_pending and self._activation_vector:
+            start_phase = _phase_from_mcu_start_position(
+                self._mcu_moves[0].start_position)
             self._record_continuity(
                 'activation',
                 self._activation_vector.get('phase'),
                 self._activation_vector.get('a'),
                 self._activation_vector.get('b'),
                 start_phase)
-        elif resume_vector:
-            self._record_continuity(
-                'idle_resume',
-                resume_vector.get('phase'),
-                resume_vector.get('a'),
-                resume_vector.get('b'),
-                start_phase)
-        # Log first few segment details for diagnostics
-        if self._move_log_count <= 3:
-            for i in range(min(num_mcu, 3)):
-                m = self._mcu_moves[i]
-                logging.info("phase_seg %s: seg=%d/%d start=%d vel=%d"
-                             " accel=%d count=%d",
-                             self.name, i, num_mcu,
-                             m.start_position, m.velocity,
-                             m.acceleration, m.count)
-        # After a drained idle hold, the MCU timer still needs a fresh clock
-        # anchor even though the TMC driver may keep holding the last phase.
-        interval_ticks = self.mcu.seconds_to_clock(self.update_interval)
-        start_time = self._samples[0].time
-        start_clock = self.mcu.print_time_to_clock(start_time)
-        need_reset = self._needs_clock_reset
-        if need_reset:
-            clock = start_clock
-            self._reset_cmd.send([self.oid, clock])
-            self._needs_clock_reset = False
-        # Send MCU commands and track total interval count for drain detection
-        total_count = 0
-        for i in range(num_mcu):
-            m = self._mcu_moves[i]
-            self._queue_cmd.send([self.oid, interval_ticks,
-                                  m.start_position, m.velocity,
-                                  m.acceleration, m.count])
-            total_count += m.count
-        self._expected_end_clock = start_clock + total_count * interval_ticks
-        self._mcu_hold_active = True
-        if self._activation_pending:
-            self._trace_event('activate_first_emit',
-                              start=start_time, flush=flush_time,
-                              first=self._positions[0],
-                              last=self._positions[num_samples - 1],
-                              start_phase=start_phase,
-                              reset=need_reset)
             self._activation_pending = False
-        self._trace_event('queue_move', start=start_time, flush=flush_time,
-                          samples=num_samples, mcu=num_mcu,
-                          first=self._positions[0],
-                          last=self._positions[num_samples - 1],
-                          start_phase=start_phase, end_phase=end_phase,
-                          reset=need_reset)
+            self._trace_event('activate_first_emit',
+                              flush=flush_time, anchor=self._mcu_anchor_pos,
+                              start_phase=start_phase, num_mcu=num_mcu)
+        if num_mcu > 0:
+            self._trace_event('queue', flush=flush_time, samples=n,
+                              mcu=num_mcu,
+                              anchor_after=self._mcu_anchor_pos)
 
 class TMCPhaseStepping:
     """Klipper module for configuring phase stepping on TMC5160 drivers."""
@@ -894,6 +832,18 @@ class TMCPhaseStepping:
         self.phase_steppers = {}
         self._phase_stepping_enabled = False
         self._fault_pending = False
+        # AWD pair config: each line is "stepper_a, stepper_b".  Multiple
+        # phase_pair entries (one per pair) are supported via Klipper's
+        # repeat-key syntax (phase_pair, phase_pair2, ...).
+        self._pair_specs = []
+        for opt_name in config.get_prefix_options('phase_pair'):
+            opt_val = config.get(opt_name)
+            members = [m.strip() for m in opt_val.split(',') if m.strip()]
+            if len(members) != 2:
+                raise config.error(
+                    "%s '%s': expected exactly two stepper names, got '%s'"
+                    % (self.name, opt_name, opt_val))
+            self._pair_specs.append(tuple(members))
         self.printer.register_event_handler('klippy:ready',
                                             self._handle_ready)
         self.printer.register_event_handler(
@@ -914,48 +864,33 @@ class TMCPhaseStepping:
                                desc="Query phase stepper diagnostics")
         gcode.register_command('TEST_XDIRECT', self.cmd_TEST_XDIRECT,
                                desc="Manual XDIRECT test on first stepper")
-    def _phase_axis_key(self, name):
-        suffix = name.split()[-1]
-        if suffix.startswith("stepper_"):
-            suffix = suffix[len("stepper_"):]
-        return suffix[:1].lower() if suffix else name
-    def _auto_bus_slot(self, name, slot_count):
-        axis = self._phase_axis_key(name)
-        preferred = {'x': 0, 'y': 1, 'z': 2}
-        if axis in preferred and preferred[axis] < slot_count:
-            return preferred[axis]
-        axes = []
-        for pname in sorted(self.phase_steppers):
-            paxis = self._phase_axis_key(pname)
-            if paxis not in axes:
-                axes.append(paxis)
-        return axes.index(axis) % slot_count
-    def _configure_bus_slots(self):
-        if not self.phase_steppers:
-            return
-        explicit_slots = [ps.bus_slots for ps in self.phase_steppers.values()
-                          if ps.bus_slots]
-        slot_count = max(explicit_slots) if explicit_slots else (
-            2 if len(self.phase_steppers) > 2 else 1)
-        slot_count = max(1, min(4, slot_count))
-        for name, ps in sorted(self.phase_steppers.items()):
-            slot = ps.bus_slot if ps.bus_slot >= 0 else (
-                self._auto_bus_slot(name, slot_count))
-            if slot >= slot_count:
-                raise self.printer.command_error(
-                    "%s phase_bus_slot=%d is outside phase_bus_slots=%d"
-                    % (name, slot, slot_count))
-            ps.set_bus_slot(slot, slot_count)
-            logging.info("Phase stepping %s: bus_slot=%d/%d",
-                         name, slot, slot_count)
+    def _resolve_pairs(self):
+        """Wire each MCU_phase_stepper's _pair_partner pointer based on the
+        phase_pair config.  Called once before first activate."""
+        # Build name -> ps lookup that's indifferent to the leading
+        # 'tmc5160 ' prefix in self.phase_steppers keys.
+        name_to_ps = {}
+        for full_name, ps in self.phase_steppers.items():
+            stepper_name = ps.stepper.get_name()
+            name_to_ps[stepper_name] = ps
+            name_to_ps[full_name] = ps
+        for a, b in self._pair_specs:
+            ps_a = name_to_ps.get(a)
+            ps_b = name_to_ps.get(b)
+            if ps_a is None or ps_b is None:
+                logging.warning(
+                    "Phase stepping: phase_pair '%s, %s' references missing"
+                    " stepper(s); pair binding skipped.", a, b)
+                continue
+            ps_a._pair_partner = ps_b
+            ps_b._pair_partner = ps_a
+            logging.info("Phase stepping pair: %s <-> %s", a, b)
     def _activate_all(self):
-        # Activate all phase steppers without forcing a cross-motor stagger.
-        # The MCU scheduler keeps independent due times on one shared clock.
         if self._phase_stepping_enabled:
             return
-        self._configure_bus_slots()
+        self._resolve_pairs()
         for name, ps in self.phase_steppers.items():
-            ps.activate(stagger_ticks=0)
+            ps.activate()
         self._phase_stepping_enabled = True
     def _handle_ready(self):
         pass  # Don't activate at boot — wait for first homing cycle
@@ -1101,13 +1036,10 @@ class TMCPhaseStepping:
                     cur_a, cur_b,
                     pwmconf, drv_status, cs_actual, bool(fsactive),
                     bool(stst), chopconf))
-        # Flag clock reset and fast-forward generator time since we stopped
-        toolhead = self.printer.lookup_object("toolhead")
-        cur_time = toolhead.get_last_move_time()
+        # Flag clock reset since we stopped the timer for status read.
         for name, ps in self.phase_steppers.items():
             if was_active[name]:
-                ps._had_zero_samples = True
-                ps._set_idle_boundary(cur_time, label='status-stop')
+                ps._needs_clock_reset = True
     def cmd_DEBUG(self, gcmd):
         """PHASE_STEPPER_DEBUG - non-disruptive host/MCU state dump.
         MOTOR=stepper_x optionally limits output to one motor.
@@ -1153,10 +1085,9 @@ class TMCPhaseStepping:
                 logging.info("Phase stepping TMC debug query failed for %s: %s",
                              name, e)
             gcmd.respond_info(
-                "%s: active=%s needs_reset=%s expected_end_clock=%d"
-                " update_hz=%.0f bus_slot=%d/%d"
-                " idle_lookback=%.3f resume_lookback=%.3f"
-                " idle_hold_cfg=%.3f"
+                "%s: active=%s needs_reset=%s"
+                " update_hz=%.0f phase_bus=%d"
+                " anchor_pos=0x%08x anchor_clock=%d"
                 " sample_window=%.3f"
                 " max_error=%.3f"
                 " mcu_status=%s tmc_status=%s"
@@ -1171,13 +1102,13 @@ class TMCPhaseStepping:
                 " drv_otpw=%s drv_s2ga=%s drv_s2gb=%s"
                 " drv_ola=%s drv_olb=%s"
                 " gstat_reset=%s gstat_drv_err=%s gstat_uv_cp=%s"
-                " live_faststandstill=%s" % (
+                " live_faststandstill=%s"
+                " pair_partner=%s" % (
                     name, ps._phase_stepping_active,
-                    ps._needs_clock_reset, ps._expected_end_clock,
-                    ps.update_rate, ps.bus_slot, ps.bus_slots,
-                    ps.idle_lookback,
-                    ps.resume_lookback,
-                    ps.idle_hold_time,
+                    ps._needs_clock_reset,
+                    ps.update_rate, ps.phase_bus,
+                    ps._mcu_anchor_pos & 0xFFFFFFFF,
+                    ps._mcu_anchor_clock,
                     (MAX_PHASE_SAMPLES - 1) * ps.update_interval,
                     ps.max_error, mcu_status, tmc_status,
                     tmc_state.get('ihold', 'n/a'),
@@ -1207,9 +1138,10 @@ class TMCPhaseStepping:
                     tmc_state.get('gstat_reset', 'n/a'),
                     tmc_state.get('gstat_drv_err', 'n/a'),
                     tmc_state.get('gstat_uv_cp', 'n/a'),
-                    tmc_state.get('live_faststandstill', 'n/a')))
+                    tmc_state.get('live_faststandstill', 'n/a'),
+                    (ps._pair_partner.stepper.get_name()
+                     if ps._pair_partner is not None else 'none')))
             preload = ps._activation_vector
-            idle_vec = ps._last_idle_vector
             continuity = ps._last_continuity
             mcu_last_phase = mstat.get('last_phase', None)
             if isinstance(mcu_last_phase, int):
@@ -1240,15 +1172,11 @@ class TMCPhaseStepping:
                     tmc_state.get('mscuract_phase', 'n/a'),
                     tmc_state.get('xdirect_phase', 'n/a')))
             gcmd.respond_info(
-                "%s continuity: hold_phase=%s hold_a=%s hold_b=%s"
-                " origin=%s from_phase=%s to_phase=%s"
+                "%s continuity: origin=%s from_phase=%s to_phase=%s"
                 " delta_phase=%s delta_peak=%s"
                 " mcu_last_phase=%s mcu_last_a=%s mcu_last_b=%s"
                 " xtarget_to_mcu_delta=%s" % (
-                    name, idle_vec.get('phase', 'n/a'),
-                    idle_vec.get('a', 'n/a'),
-                    idle_vec.get('b', 'n/a'),
-                    continuity.get('origin', 'n/a'),
+                    name, continuity.get('origin', 'n/a'),
                     continuity.get('from_phase', 'n/a'),
                     continuity.get('to_phase', 'n/a'),
                     continuity.get('delta_phase', 'n/a'),
@@ -1324,19 +1252,8 @@ class TMCPhaseStepping:
         reactivate = gcmd.get_int(
             "REACTIVATE", 1 if active_before else 0, minval=0, maxval=1)
         if reactivate and active_before:
-            if self._home_rails_depth or self._homing_move_depth:
-                reactivate = 0
-                gcmd.respond_info(
-                    "Homing is active; direction override will apply on the"
-                    " next activation instead of reactivating now")
-            else:
-                buffered_motion = self._buffered_motion_time()
-                if buffered_motion > 0.050:
-                    raise gcmd.error(
-                        "Refusing to change active phase direction with"
-                        " %.3fs of motion still buffered" % (buffered_motion,))
-                self._deactivate_all("direction override change",
-                                     flush_toolhead=True)
+            self._deactivate_all("direction override change",
+                                 flush_toolhead=True)
         for name in names:
             ps = self.phase_steppers[name]
             ps._phase_direction_override = sign

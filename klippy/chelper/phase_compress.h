@@ -32,4 +32,14 @@ int phase_compressor_to_fixed(struct phase_compressed_move *segments
                               , int num_segments
                               , struct phase_mcu_move *out_mcu, int max_out);
 
+// Anchored compression: produces phase_mcu_move directly with int32
+// start_position chained bit-exactly with the MCU's per-tick advance loop.
+// First segment is forced to start at `anchor_fixed` (16.16 fixed-point);
+// subsequent segments anchor at the previous segment's last-emitted phase.
+int phase_compressor_compress_anchored(struct phase_compressor *pc
+                                       , double *positions, int num_samples
+                                       , int32_t anchor_fixed
+                                       , struct phase_mcu_move *out_mcu
+                                       , int max_out);
+
 #endif // phase_compress.h

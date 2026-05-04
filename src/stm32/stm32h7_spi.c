@@ -4,8 +4,10 @@
 //
 // This file may be distributed under the terms of the GNU GPLv3 license.
 
+#include "autoconf.h" // CONFIG_WANT_SPI_DMA
 #include "board/io.h" // readb, writeb
 #include "command.h" // shutdown
+#include "generic/armcm_boot.h" // armcm_enable_irq
 #include "gpio.h" // spi_setup
 #include "internal.h" // gpio_peripheral
 #include "sched.h" // sched_shutdown
@@ -155,3 +157,263 @@ spi_transfer(struct spi_config config, uint8_t receive_data,
     spi->IFCR = 0xFFFFFFFF;
     spi->CR1 = SPI_CR1_SSI;
 }
+
+#if CONFIG_WANT_SPI_DMA
+// =====================================================================
+// DMA-driven fire-and-forget SPI TX path.
+// Used by tmc_phase_stepper.c group ISR.  Allocates one DMA1 stream per
+// SPI peripheral (TX only — TMC XDIRECT writes are write-only at the ISR
+// level).  Caller is responsible for chip-select handling: pull CS low
+// before kick_tx, raise CS in the dma_done callback (called from the
+// DMA-TC IRQ at NVIC priority 1 — same level as USB/CAN, one tier
+// above SysTick).
+//
+// DMAMUX request line numbers from RM0468 (STM32H723):
+//   SPI1_TX = 38, SPI2_TX = 40, SPI3_TX = 62,
+//   SPI4_TX = 84, SPI5_TX = 86.  SPI6 uses BDMA (different controller)
+//   and is not handled here.
+// =====================================================================
+
+#include "spicmds.h" // spi_dma_done_fn
+
+#define MAX_SPI_DMA_BUSES 5  // SPI1..SPI5
+
+struct spi_dma_state {
+    SPI_TypeDef *spi;            // identifies the bus this state belongs to
+    DMA_Stream_TypeDef *stream;
+    DMAMUX_Channel_TypeDef *mux_chan;
+    uint8_t mux_request;
+    volatile uint8_t inflight;
+    spi_dma_done_fn cb;
+    void *ctx;
+};
+
+static struct spi_dma_state spi_dma_states[MAX_SPI_DMA_BUSES];
+static uint8_t spi_dma_state_count;
+
+// Find or allocate a DMA state slot for this SPI peripheral.
+static struct spi_dma_state *
+spi_dma_state_for(SPI_TypeDef *spi)
+{
+    for (uint8_t i = 0; i < spi_dma_state_count; i++)
+        if (spi_dma_states[i].spi == spi)
+            return &spi_dma_states[i];
+    return NULL;
+}
+
+// Map an SPI peripheral to (stream, dmamux channel, request line).
+// Returns 1 on success, 0 if the SPI isn't supported here.
+static int
+spi_dma_default_assignment(SPI_TypeDef *spi, DMA_Stream_TypeDef **out_stream,
+                           DMAMUX_Channel_TypeDef **out_mux,
+                           uint8_t *out_request, IRQn_Type *out_irq)
+{
+    if (spi == SPI1) {
+        *out_stream = DMA1_Stream0; *out_mux = DMAMUX1_Channel0;
+        *out_request = 38; *out_irq = DMA1_Stream0_IRQn; return 1;
+    }
+    if (spi == SPI2) {
+        *out_stream = DMA1_Stream1; *out_mux = DMAMUX1_Channel1;
+        *out_request = 40; *out_irq = DMA1_Stream1_IRQn; return 1;
+    }
+#ifdef SPI3
+    if (spi == SPI3) {
+        *out_stream = DMA1_Stream2; *out_mux = DMAMUX1_Channel2;
+        *out_request = 62; *out_irq = DMA1_Stream2_IRQn; return 1;
+    }
+#endif
+#ifdef SPI4
+    if (spi == SPI4) {
+        *out_stream = DMA1_Stream3; *out_mux = DMAMUX1_Channel3;
+        *out_request = 84; *out_irq = DMA1_Stream3_IRQn; return 1;
+    }
+#endif
+#ifdef SPI5
+    if (spi == SPI5) {
+        *out_stream = DMA1_Stream4; *out_mux = DMAMUX1_Channel4;
+        *out_request = 86; *out_irq = DMA1_Stream4_IRQn; return 1;
+    }
+#endif
+    return 0;
+}
+
+// Per-stream IRQ handler shared body.  Called from the per-stream
+// IRQHandler thunks below.  Cleans up DMA + SPI peripherals and invokes
+// the user-supplied completion callback.
+static void
+spi_dma_handle_tc(struct spi_dma_state *st, volatile uint32_t *clear_reg,
+                  uint32_t clear_mask)
+{
+    *clear_reg = clear_mask;
+    st->stream->CR &= ~DMA_SxCR_EN;
+    SPI_TypeDef *spi = st->spi;
+    // Wait for trailing SCLK edge.  EOT typically asserts within a few
+    // cycles of DMA TC because the SPI peripheral has finished shifting
+    // by the time DMA reports complete.
+    uint32_t deadline = timer_read_time() + timer_from_us(2);
+    while ((spi->SR & SPI_SR_EOT) == 0
+           && timer_is_before(timer_read_time(), deadline))
+        ;
+    spi->IFCR = 0xFFFFFFFF;
+    spi->CFG1 &= ~SPI_CFG1_TXDMAEN;
+    spi->CR1 = SPI_CR1_SSI;
+    spi_dma_done_fn cb = st->cb;
+    void *ctx = st->ctx;
+    st->cb = NULL;
+    st->ctx = NULL;
+    st->inflight = 0;
+    if (cb)
+        cb(ctx);
+}
+
+// One IRQ handler per assignable stream.  Each looks up its state by
+// matching the stream pointer in the dma_states[] table.  The compiler
+// folds these to small thunks.
+static struct spi_dma_state *
+spi_dma_state_for_stream(DMA_Stream_TypeDef *stream)
+{
+    for (uint8_t i = 0; i < spi_dma_state_count; i++)
+        if (spi_dma_states[i].stream == stream)
+            return &spi_dma_states[i];
+    return NULL;
+}
+
+void
+DMA1_Stream0_IRQHandler(void)
+{
+    struct spi_dma_state *st = spi_dma_state_for_stream(DMA1_Stream0);
+    if (st)
+        spi_dma_handle_tc(st, &DMA1->LIFCR, DMA_LIFCR_CTCIF0);
+}
+void
+DMA1_Stream1_IRQHandler(void)
+{
+    struct spi_dma_state *st = spi_dma_state_for_stream(DMA1_Stream1);
+    if (st)
+        spi_dma_handle_tc(st, &DMA1->LIFCR, DMA_LIFCR_CTCIF1);
+}
+void
+DMA1_Stream2_IRQHandler(void)
+{
+    struct spi_dma_state *st = spi_dma_state_for_stream(DMA1_Stream2);
+    if (st)
+        spi_dma_handle_tc(st, &DMA1->LIFCR, DMA_LIFCR_CTCIF2);
+}
+void
+DMA1_Stream3_IRQHandler(void)
+{
+    struct spi_dma_state *st = spi_dma_state_for_stream(DMA1_Stream3);
+    if (st)
+        spi_dma_handle_tc(st, &DMA1->LIFCR, DMA_LIFCR_CTCIF3);
+}
+void
+DMA1_Stream4_IRQHandler(void)
+{
+    struct spi_dma_state *st = spi_dma_state_for_stream(DMA1_Stream4);
+    if (st)
+        spi_dma_handle_tc(st, &DMA1->HIFCR, DMA_HIFCR_CTCIF4);
+}
+
+// Register the IRQ handlers in the vector table.  buildcommands.py picks
+// these up at compile time even though no init function calls them.
+DECL_ARMCM_IRQ(DMA1_Stream0_IRQHandler, DMA1_Stream0_IRQn);
+DECL_ARMCM_IRQ(DMA1_Stream1_IRQHandler, DMA1_Stream1_IRQn);
+DECL_ARMCM_IRQ(DMA1_Stream2_IRQHandler, DMA1_Stream2_IRQn);
+DECL_ARMCM_IRQ(DMA1_Stream3_IRQHandler, DMA1_Stream3_IRQn);
+DECL_ARMCM_IRQ(DMA1_Stream4_IRQHandler, DMA1_Stream4_IRQn);
+
+// Lazy per-bus DMA setup.  Called from spi_dma_kick_tx the first time we
+// see a particular SPI peripheral.  Allocates an entry in spi_dma_states[]
+// and configures the DMA stream + DMAMUX channel.
+static struct spi_dma_state *
+spi_dma_init_bus(SPI_TypeDef *spi)
+{
+    if (spi_dma_state_count >= MAX_SPI_DMA_BUSES)
+        return NULL;
+    DMA_Stream_TypeDef *stream;
+    DMAMUX_Channel_TypeDef *mux;
+    uint8_t request;
+    IRQn_Type irq;
+    if (!spi_dma_default_assignment(spi, &stream, &mux, &request, &irq))
+        return NULL;
+    // Enable DMA1 + DMAMUX1 clocks.  RCC layout: AHB1ENR.DMA1EN bit 0;
+    // DMAMUX1 sits on the same clock domain as DMA1.
+    RCC->AHB1ENR |= RCC_AHB1ENR_DMA1EN;
+    (void)RCC->AHB1ENR; // post-write read for clock enable propagation
+
+    struct spi_dma_state *st = &spi_dma_states[spi_dma_state_count++];
+    st->spi = spi;
+    st->stream = stream;
+    st->mux_chan = mux;
+    st->mux_request = request;
+    st->inflight = 0;
+    st->cb = NULL;
+    st->ctx = NULL;
+
+    // DMAMUX channel: select the SPIx_TX request line.
+    mux->CCR = request;
+    // DMA stream: ensure disabled, then program for mem->peripheral.
+    stream->CR = 0;
+    while (stream->CR & DMA_SxCR_EN) ;
+    stream->FCR = 0;  // direct mode (no FIFO)
+    stream->PAR = (uint32_t)&spi->TXDR;
+    stream->CR = (DMA_SxCR_DIR_0       // memory-to-peripheral
+                  | DMA_SxCR_MINC      // memory increment
+                  | DMA_SxCR_PL_1      // priority high
+                  | DMA_SxCR_TCIE);    // transfer-complete interrupt enable
+    // PSIZE / MSIZE = byte (00) — bits left at zero.
+
+    // Install the per-stream IRQ at priority 1 (matches USB/CAN convention,
+    // one tier above SysTick=2 so DMA TC always fires promptly after the
+    // group ISR has kicked).
+    NVIC_SetPriority(irq, 1);
+    NVIC_EnableIRQ(irq);
+    return st;
+}
+
+// Public: kick a fire-and-forget DMA TX on `spi`.  Returns 0 on accept,
+// -1 if a transfer is already in flight on this bus.  ISR-callable.
+// `tx_buf` MUST be in DMA-coherent memory (use the .dma_buf section
+// attribute on H7 — DTCM at 0x20000000 is CPU-private).
+//
+// Argument is void* to keep stm32h7xx.h out of spicmds.c.  Internally
+// cast back to SPI_TypeDef*.
+int
+spi_dma_kick_tx(void *spi_void, uint8_t *tx_buf, uint16_t len,
+                spi_dma_done_fn cb, void *ctx)
+{
+    SPI_TypeDef *spi = (SPI_TypeDef *)spi_void;
+    struct spi_dma_state *st = spi_dma_state_for(spi);
+    if (st == NULL) {
+        st = spi_dma_init_bus(spi);
+        if (st == NULL)
+            return -1;
+    }
+    if (st->inflight)
+        return -1;
+    st->inflight = 1;
+    st->cb = cb;
+    st->ctx = ctx;
+
+    // Program the DMA stream with the new buffer + length.
+    DMA_Stream_TypeDef *stream = st->stream;
+    stream->NDTR = len;
+    stream->M0AR = (uint32_t)tx_buf;
+    stream->CR |= DMA_SxCR_EN;
+
+    // Configure SPI for this transfer length and enable TX-DMA request.
+    spi->CR2 = len << SPI_CR2_TSIZE_Pos;
+    spi->CFG1 |= SPI_CFG1_TXDMAEN;
+    spi->CR1 = SPI_CR1_SSI | SPI_CR1_SPE;
+    spi->CR1 = SPI_CR1_SSI | SPI_CR1_CSTART | SPI_CR1_SPE;
+    return 0;
+}
+
+uint8_t
+spi_dma_is_inflight(void *spi_void)
+{
+    SPI_TypeDef *spi = (SPI_TypeDef *)spi_void;
+    struct spi_dma_state *st = spi_dma_state_for(spi);
+    return st ? st->inflight : 0;
+}
+#endif // CONFIG_WANT_SPI_DMA
