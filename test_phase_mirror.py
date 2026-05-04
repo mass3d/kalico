@@ -1,15 +1,16 @@
 """Bit-exact verification of the host-side phase-position mirror.
 
-The host emits compressed phase segments to the MCU. To prevent
-resume-from-idle clicks, every new compressed segment must start at
-EXACTLY the position the MCU will be holding when the segment
-arrives. The host computes that anchor in closed form using the
-same int32 arithmetic the MCU uses per-tick. This script verifies
-the closed form against an explicit N-tick simulation of the MCU
-loop.
+The host emits compressed phase segments to the MCU. For chain continuity
+each new segment's start_position must equal the position the MCU will
+hold the moment load_next runs — i.e. ps->position *after* count
+tick-advances of the previous segment, NOT the last value the previous
+segment emitted. The host computes that next-anchor in closed form using
+the same int32 arithmetic the MCU uses per-tick. This script verifies the
+closed form against an explicit N-tick simulation of the MCU loop.
 
-If this test ever fails, the host mirror has drifted from the MCU
-and segment boundaries will produce phase discontinuities.
+If this test ever fails, the host mirror has drifted from the MCU and
+segment boundaries will produce phase discontinuities (or freeze the
+emission stream entirely).
 """
 
 import random
@@ -28,12 +29,14 @@ def _to_int32(x):
 
 def simulate_advance(start, vel, accel, count):
     """N-tick simulation matching the MCU's phase_stepper_advance loop:
-        emitted = position
+        emitted = position    # emit before advancing
         position += velocity
         velocity += acceleration
-        if --count == 0: position = emitted; load_next.
-    Returns the LAST emitted position (which is what the MCU restores to
-    `position` and what the next segment must anchor at).
+        if --count == 0: load_next overwrites position with the next
+            segment's start_position.
+    Returns ps->position after `count` advances — what load_next has to
+    overwrite, and therefore what the next segment's start_position must
+    equal for continuous chaining.
     All arithmetic wraps at int32 boundaries.
     """
     if count <= 0:
@@ -41,29 +44,25 @@ def simulate_advance(start, vel, accel, count):
     position = _to_int32(start)
     velocity = _to_int32(vel)
     acceleration = _to_int32(accel)
-    last_emitted = position
     for _ in range(count):
-        last_emitted = position
+        # emitted = position  # (not used; we only need post-loop state)
         position = _to_int32(position + velocity)
         velocity = _to_int32(velocity + acceleration)
-    return last_emitted
+    return position
 
 
 def advance_mirror(start, vel, accel, count):
-    """Closed-form last-emitted position after a (start, vel, accel, count)
-    segment, matching the MCU loop. All arithmetic done as Python ints,
-    wrapped to int32 at the end.
+    """Closed-form position after `count` tick-advances, matching the MCU
+    loop. All arithmetic done as Python ints, wrapped to int32 at the end.
 
-    Derivation (count=N, last emitted is at tick N-1, zero-indexed):
-        emit_i = start + i*vel + accel * i*(i-1)/2
-        last  = start + (N-1)*vel + accel * (N-1)*(N-2)/2
+    Derivation (count=N):
+        position_after_N = start + N*vel + accel * N*(N-1)/2
+    (N*(N-1) is always even, so the //2 is exact integer division.)
     """
     if count <= 0:
         return _to_int32(start)
-    n_minus_1 = count - 1
-    n_choose_2 = n_minus_1 * (count - 2) // 2  # exact even/odd handled by //2
-    # Note: (N-1)*(N-2) is always even, so the //2 is exact integer division.
-    raw = start + n_minus_1 * vel + n_choose_2 * accel
+    n_choose_2 = count * (count - 1) // 2
+    raw = start + count * vel + n_choose_2 * accel
     return _to_int32(raw)
 
 
@@ -96,19 +95,24 @@ def run_tests(n_trials=10000, seed=0):
 
 
 if __name__ == "__main__":
-    # Boundary cases first
+    # Boundary cases first.  Expected values describe ps->position AFTER
+    # `count` tick-advances (i.e. the would-be next emission).
     boundary_cases = [
-        # (start, vel, accel, count, expected_last_emitted)
-        (0, 0, 0, 1, 0),
+        # (start, vel, accel, count, expected_position_after_count_advances)
+        (0, 0, 0, 1, 0),            # no motion regardless of count
         (0, 0, 0, 100, 0),
         (12345, 0, 0, 50, 12345),
-        (0, 65536, 0, 1, 0),
-        (0, 65536, 0, 4, 3 * 65536),
-        (0, 0, 65536, 4, 3),  # accel=1 (in 16.16); last emit = (3*2/2)*65536 = 3*65536? wait
+        (0, 65536, 0, 1, 65536),    # 1 advance at vel=1.0 -> position=1.0
+        (0, 65536, 0, 4, 4 * 65536),  # 4 advances at vel=1.0 -> position=4.0
         # accel=65536 means accel/tick = 1.0 microstep/tick^2
-        # last emit at tick 3 = 0 + 3*0 + 3*2/2 * 65536 = 3 * 65536 = 196608
+        # After 4 advances starting from (0, 0, 1):
+        #   tick 0: pos=0,    vel=0    -> after: pos=0,    vel=1
+        #   tick 1: pos=0,    vel=1    -> after: pos=1,    vel=2
+        #   tick 2: pos=1,    vel=2    -> after: pos=3,    vel=3
+        #   tick 3: pos=3,    vel=3    -> after: pos=6,    vel=4
+        # Closed form: start + N*vel + N(N-1)/2 * accel = 0 + 4*0 + 6*65536 = 393216
+        (0, 0, 65536, 4, 6 * 65536),
     ]
-    boundary_cases[-1] = (0, 0, 65536, 4, 3 * 65536)
 
     for case in boundary_cases:
         start, vel, accel, count, expected = case

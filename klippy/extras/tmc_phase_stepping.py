@@ -9,6 +9,12 @@ from .. import chelper
 FIXED_POINT_SCALE = 65536.  # 16.16 fixed-point
 PHASE_ACTIVE_TPOWERDOWN = 255
 
+# Host-side version marker — bumped on each tmc_phase_stepping.py change
+# so deploys can be verified via klippy.log.  MCU firmware version is
+# tracked separately via the PHASE_STEPPER_VER constant in
+# src/tmc_phase_stepper.c (queryable through MCU_constants).
+HOST_PHASE_STEPPER_VER = "v9-pair-generator-sync"
+
 # Maximum number of position samples per flush cycle.
 # At the default 10kHz update rate, 32768 samples cover ~3.28s. Real AWD logs
 # showed the first resumed flush arriving ~1.25s after motion started; with the
@@ -16,8 +22,14 @@ PHASE_ACTIVE_TPOWERDOWN = 255
 # the host queued the move from mid-trajectory. 32768 leaves headroom for that
 # long first-flush latency while keeping the whole resume on the host side.
 MAX_PHASE_SAMPLES = 32768
-# Maximum number of compressed segments per flush cycle
-MAX_PHASE_SEGMENTS = 1024
+# Maximum number of compressed segments emitted per motor per flush.
+# Each emitted segment consumes one node in the MCU's shared move_alloc pool
+# (size 1024, also used by stepcompress and other queued-move users). With
+# four phase-stepped motors plus the rest of the printer, the per-motor cap
+# must keep the worst-case in-flight total well below 1024. With healthy
+# compression, normal motion produces only a handful of segments per flush;
+# this cap is just a safety bound against pathological compressor behavior.
+MAX_PHASE_SEGMENTS = 128
 
 
 def _mask_shift(mask):
@@ -141,6 +153,8 @@ class MCU_phase_stepper:
         self._pair_partner = None
         self._pair_reset_consumed_clock = None
         self._invalid_flush_count = 0
+        self._emit_log_count = 0
+        self._last_emit_motion = False
         self._faulted = False
         self._fault_handler = None
         self._phase_step_dist = None
@@ -271,6 +285,18 @@ class MCU_phase_stepper:
     def _handle_connect(self):
         toolhead = self.printer.lookup_object("toolhead")
         toolhead.register_step_generator(self.generate_and_queue)
+        # Log MCU firmware version so it's obvious whether a fresh flash
+        # carries the latest phase-stepping fixes.  If "missing" appears,
+        # the MCU was NOT reflashed with v7+ firmware.
+        try:
+            ver = self.mcu.get_constants().get(
+                "PHASE_STEPPER_VER", "missing")
+            logging.info(
+                "Phase stepping %s: HOST_PHASE_STEPPER_VER=%s"
+                " MCU firmware PHASE_STEPPER_VER=%s",
+                self.name, HOST_PHASE_STEPPER_VER, ver)
+        except Exception:
+            pass
     def set_fault_handler(self, cb):
         self._fault_handler = cb
     def _trace_event(self, kind, **fields):
@@ -471,6 +497,8 @@ class MCU_phase_stepper:
         cur_a_u16 = cur_a & 0xFFFF
         self._needs_clock_reset = True
         self._invalid_flush_count = 0
+        self._emit_log_count = 0
+        self._last_emit_motion = False
         self._faulted = False
         self._pair_reset_consumed_clock = None
         # Configure the phase generator with the stepper's kinematics.
@@ -590,6 +618,20 @@ class MCU_phase_stepper:
             self.printer.get_reactor().monotonic())
         self._ffi_lib.phase_generator_set_time(
             self._phase_generator, current_print_time)
+        # Seed the generator's "held position" to the activate-time phase so
+        # samples taken in pre-move windows (e.g. between activate and the
+        # first G1 after an idle gap) return the held phase via the
+        # last_position fallback in phase_generator_generate, instead of
+        # extrapolating an unrelated trapq move backwards in time.
+        activate_phase_pos = (self.stepper.get_commanded_position()
+                              / step_dist * (256.0 / microsteps)
+                              * direction + phase_offset)
+        self._ffi_lib.phase_generator_set_last_position(
+            self._phase_generator, activate_phase_pos)
+        logging.info(
+            "Phase stepping %s: v3 activate seed_last_position=%.6f"
+            " current_print_time=%.6f",
+            self.name, activate_phase_pos, current_print_time)
         # Intercept M84/idle_timeout: replace TMCCommandHelper's
         # _do_disable / _do_enable so the chopper stays on while phase
         # stepping is active. The TMC5160 class doesn't store its
@@ -641,18 +683,18 @@ class MCU_phase_stepper:
         return ((phase_pos - self._phase_offset)
                 * self._phase_step_dist / self._phase_direction)
     def _advance_mirror(self, start, vel, accel, count):
-        """Closed-form last-emitted phase position after a (start, vel, accel,
-        count) segment.  Bit-exact match for the MCU's per-tick advance
-        (position += velocity; velocity += acceleration).  All arithmetic
-        wraps at int32, then result is reduced mod 1024<<16 (= 0x04000000)
-        so it fits the compressor's anchor convention."""
+        """Closed-form position the MCU holds *after* `count` tick-advances.
+        Bit-exact match for the MCU's per-tick advance (position += velocity;
+        velocity += acceleration); after `count` advances ps->position equals
+        start + count*vel + count*(count-1)/2 * accel.  This is the value
+        load_next would read as the next segment's start, so chaining via
+        this formula keeps the host mirror aligned with the MCU.  Result is
+        reduced mod 1024<<16 (= 0x04000000) to fit the compressor's
+        reduced-anchor convention."""
         if count <= 0:
             return start & 0x03FFFFFF
-        n_minus_1 = count - 1
-        n_choose_2 = (n_minus_1 * (n_minus_1 - 1)) // 2
-        raw = start + n_minus_1 * vel + n_choose_2 * accel
-        # Wrap to int32 signed first, then reduce mod 1024<<16 to match the
-        # compressor's reduced-anchor convention.
+        n_choose_2 = (count * (count - 1)) // 2
+        raw = start + count * vel + n_choose_2 * accel
         raw &= 0xFFFFFFFF
         if raw & 0x80000000:
             raw -= 0x100000000
@@ -745,11 +787,76 @@ class MCU_phase_stepper:
         if not self._phase_stepping_active:
             return
         ffi_lib = self._ffi_lib
+        if self._needs_clock_reset:
+            # Re-anchor the generator just before the first emission so
+            # start_clock lands in the future.  Without this, an idle gap
+            # between activate and the first move leaves last_flush_time
+            # stale and sched_add_timer on the MCU trips "Timer too close".
+            #
+            # Compute everything in MCU clock units so the math doesn't
+            # depend on the per-MCU print_time / adj_offset relationship —
+            # then convert the chosen clock back to print_time for the
+            # generator's last_flush_time.  The host->MCU buffer is the
+            # raw "this far ahead of MCU's current clock" interval; we
+            # don't have to reason about secondary-MCU offsets at all.
+            reactor = self.printer.get_reactor()
+            now_pt = self.mcu.estimated_print_time(reactor.monotonic())
+            now_clock = self.mcu.print_time_to_clock(now_pt)
+            flush_clock = self.mcu.print_time_to_clock(flush_time)
+            # 0.050s matches STEPCOMPRESS_FLUSH_TIME in toolhead.py — the
+            # standard "send commands this far ahead of wall clock" buffer
+            # that absorbs host->MCU command latency.
+            min_buffer = 0.050
+            buffer_ticks = self.mcu.seconds_to_clock(min_buffer)
+            safe_clock = now_clock + buffer_ticks
+            safe_start = self.mcu.clock_to_print_time(safe_clock)
+            logging.info(
+                "Phase stepping %s: first_emit_anchor now_pt=%.6f"
+                " now_clock=%d flush_time=%.6f flush_clock=%d"
+                " buffer_ticks=%d safe_clock=%d safe_start=%.6f",
+                self.name, now_pt, now_clock, flush_time, flush_clock,
+                buffer_ticks, safe_clock, safe_start)
+            self._trace_event(
+                'first_emit_anchor', now_pt=now_pt, now_clock=now_clock,
+                flush_time=flush_time, flush_clock=flush_clock,
+                buffer_ticks=buffer_ticks, safe_clock=safe_clock,
+                safe_start=safe_start)
+            if safe_start >= flush_time:
+                # Toolhead's flush_time is not yet far enough ahead of now;
+                # wait for the next call.
+                logging.info(
+                    "Phase stepping %s: first_emit_defer"
+                    " safe_start=%.6f flush_time=%.6f",
+                    self.name, safe_start, flush_time)
+                self._trace_event('first_emit_defer',
+                                  safe_start=safe_start, flush_time=flush_time)
+                return
+            ffi_lib.phase_generator_set_time(
+                self._phase_generator, safe_start)
+            # Pair atomicity: when this motor emits its reset_phase_clock,
+            # `_emit_reset_clock` will clear the partner's _needs_clock_reset
+            # so the partner's generate_and_queue skips this first-emit
+            # block.  Advance the partner's generator last_flush_time to
+            # the SAME safe_start so both motors sample from the same point
+            # in print_time space.  Otherwise the partner samples from its
+            # activate-time seed (way behind), produces only held-position
+            # samples, and emits hold segments while the primary emits
+            # real motion — the partner motor "stays put" while the primary
+            # moves.
+            if self._pair_partner is not None:
+                ffi_lib.phase_generator_set_time(
+                    self._pair_partner._phase_generator, safe_start)
         # Sample positions for [last_flush_time .. flush_time].
         n = ffi_lib.phase_generator_generate(
             self._phase_generator, flush_time, self._samples,
             MAX_PHASE_SAMPLES)
         if n <= 0:
+            if self._emit_log_count < 6:
+                logging.info(
+                    "Phase stepping %s: emit n=0 flush_time=%.6f"
+                    " (no new samples since last_flush_time)",
+                    self.name, flush_time)
+                self._emit_log_count += 1
             return
         # Extract into the float array; checks for NaN/inf.
         ret = ffi_lib.phase_generator_extract_positions(
@@ -780,6 +887,11 @@ class MCU_phase_stepper:
             self._phase_compressor, self._positions, n,
             self._mcu_anchor_pos, self._mcu_moves, MAX_PHASE_SEGMENTS)
         if num_mcu <= 0:
+            logging.info(
+                "Phase stepping %s: emit num_mcu=0 n=%d flush_time=%.6f"
+                " positions[0]=%.4f positions[-1]=%.4f anchor=0x%08x",
+                self.name, n, flush_time, self._positions[0],
+                self._positions[n - 1], self._mcu_anchor_pos)
             return
         # Issue reset_phase_clock on the very first emission post-activate.
         # Continuous-emission means we never need to reset mid-print — the
@@ -791,6 +903,26 @@ class MCU_phase_stepper:
         # mirror equals the MCU's last-emitted phase, ready to anchor the
         # next flush.
         interval_ticks = self.mcu.seconds_to_clock(self.update_interval)
+        first_seg = self._mcu_moves[0]
+        last_seg = self._mcu_moves[num_mcu - 1]
+        max_vel = max(abs(self._mcu_moves[i].velocity) for i in range(num_mcu))
+        is_motion = max_vel != 0
+        # Log first 4 emits, plus the moment motion first appears or stops.
+        if (self._emit_log_count < 4
+                or is_motion != self._last_emit_motion):
+            logging.info(
+                "Phase stepping %s: emit n=%d num_mcu=%d flush_time=%.6f"
+                " first(start=0x%08x vel=%d accel=%d count=%d)"
+                " last(start=0x%08x vel=%d accel=%d count=%d)"
+                " max_abs_vel=%d positions[0]=%.4f positions[-1]=%.4f",
+                self.name, n, num_mcu, flush_time,
+                first_seg.start_position, first_seg.velocity,
+                first_seg.acceleration, first_seg.count,
+                last_seg.start_position, last_seg.velocity,
+                last_seg.acceleration, last_seg.count,
+                max_vel, self._positions[0], self._positions[n - 1])
+            self._emit_log_count += 1
+        self._last_emit_motion = is_motion
         for i in range(num_mcu):
             m = self._mcu_moves[i]
             self._queue_cmd.send([self.oid, interval_ticks,
@@ -967,6 +1099,9 @@ class TMCPhaseStepping:
             'live_faststandstill': fields.get_field(
                 "faststandstill", live_gconf, "GCONF"),
             'live_shaft': fields.get_field("shaft", live_gconf, "GCONF"),
+            'live_direct_mode': bool(live_gconf & (1 << 16)),
+            'live_en_pwm_mode': bool(live_gconf & (1 << 2)),
+            'live_gconf_raw': live_gconf,
             'cs_actual': fields.get_field("cs_actual", drv_status,
                                           "DRV_STATUS"),
             'fsactive': fields.get_field("fsactive", drv_status,
@@ -1044,12 +1179,19 @@ class TMCPhaseStepping:
         """PHASE_STEPPER_DEBUG - non-disruptive host/MCU state dump.
         MOTOR=stepper_x optionally limits output to one motor.
         MCU=1 also queries MCU-side counters. TMC=1 also reads live TMC
-        standstill/current state."""
+        standstill/current state.
+        PROBE=1 reads XDIRECT four times in a row to detect whether the
+        MCU's per-tick writes are actually landing in the TMC.  If the
+        readbacks differ across the four reads, the MCU is updating
+        XDIRECT on the wire (motor SHOULD be moving, problem is mechanical
+        or driver-config).  If the readbacks are identical, the MCU's SPI
+        bursts aren't reaching the TMC even though `write_count` climbs."""
         if not self.phase_steppers:
             gcmd.respond_info("No phase steppers registered")
             return
         query_mcu = gcmd.get_int("MCU", 0, minval=0, maxval=1)
         query_tmc = gcmd.get_int("TMC", 0, minval=0, maxval=1)
+        probe_writes = gcmd.get_int("PROBE", 0, minval=0, maxval=1)
         motor_filter = gcmd.get("MOTOR", None)
         if motor_filter and motor_filter not in self.phase_steppers:
             gcmd.respond_info("Unknown motor '%s'. Available: %s"
@@ -1084,6 +1226,32 @@ class TMCPhaseStepping:
                 tmc_status = "query_error" if query_tmc else "cache_error"
                 logging.info("Phase stepping TMC debug query failed for %s: %s",
                              name, e)
+            if probe_writes and ps.tmc_obj is not None:
+                try:
+                    mcu_tmc = ps.tmc_obj.mcu_tmc
+                    # Stamp XDIRECT with a recognizable signature via the
+                    # standard SPI command path (this we KNOW works — same
+                    # path used at activate).  Then read XDIRECT four times.
+                    # If MCU's per-tick writes land at the TMC, the readbacks
+                    # differ from the signature and from each other (because
+                    # ~25 group-ISR ticks fire between consecutive reads).
+                    # If they all equal the signature, no MCU write reached
+                    # the TMC — diagnoses an SPI / DMA path issue on the
+                    # phase-stepping bus.
+                    sig = 0x00ABCDEF
+                    mcu_tmc.set_register("XTARGET", sig)
+                    rb1 = mcu_tmc.get_register("XTARGET")
+                    rb2 = mcu_tmc.get_register("XTARGET")
+                    rb3 = mcu_tmc.get_register("XTARGET")
+                    rb4 = mcu_tmc.get_register("XTARGET")
+                    overwritten = (rb1 != sig or rb2 != sig
+                                   or rb3 != sig or rb4 != sig)
+                    gcmd.respond_info(
+                        "%s probe: signature=0x%08x rb1=0x%08x rb2=0x%08x"
+                        " rb3=0x%08x rb4=0x%08x mcu_writes_landing=%s" % (
+                            name, sig, rb1, rb2, rb3, rb4, overwritten))
+                except Exception as e:
+                    gcmd.respond_info("%s probe failed: %s" % (name, e))
             gcmd.respond_info(
                 "%s: active=%s needs_reset=%s"
                 " update_hz=%.0f phase_bus=%d"
@@ -1103,6 +1271,8 @@ class TMCPhaseStepping:
                 " drv_ola=%s drv_olb=%s"
                 " gstat_reset=%s gstat_drv_err=%s gstat_uv_cp=%s"
                 " live_faststandstill=%s"
+                " live_direct_mode=%s live_en_pwm_mode=%s"
+                " live_gconf_raw=0x%08x"
                 " pair_partner=%s" % (
                     name, ps._phase_stepping_active,
                     ps._needs_clock_reset,
@@ -1139,6 +1309,9 @@ class TMCPhaseStepping:
                     tmc_state.get('gstat_drv_err', 'n/a'),
                     tmc_state.get('gstat_uv_cp', 'n/a'),
                     tmc_state.get('live_faststandstill', 'n/a'),
+                    tmc_state.get('live_direct_mode', 'n/a'),
+                    tmc_state.get('live_en_pwm_mode', 'n/a'),
+                    tmc_state.get('live_gconf_raw', 0),
                     (ps._pair_partner.stepper.get_name()
                      if ps._pair_partner is not None else 'none')))
             preload = ps._activation_vector

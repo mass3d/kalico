@@ -176,9 +176,16 @@ phase_generator_generate(struct phase_generator *pg
         // Only evaluate active moves (or kinematics pre/post-active windows).
         // Outside those windows, hold the last valid phase instead of sampling
         // unrelated trapq moves, which can return invalid values.
+        // The `t >= m->print_time` check matters for the first emission after
+        // an idle gap: the trapq advances m to "the move whose end is past t",
+        // but that move may not have started yet (t < m->print_time). Without
+        // the check, calc_position_cb extrapolates the new move's polynomial
+        // backwards in time and reports phantom motion before the move
+        // actually begins, causing the host to emit segments for motion the
+        // motor never performed.
         struct move *sample_move = NULL;
         double move_time = 0.;
-        if (phase_generator_check_active(sk, m)) {
+        if (t >= m->print_time && phase_generator_check_active(sk, m)) {
             sample_move = m;
             move_time = t - m->print_time;
             last_active = m;

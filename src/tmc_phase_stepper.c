@@ -27,6 +27,11 @@
 #include "board/irq.h" // irq_disable
 #include "board/misc.h" // timer_read_time
 #include "command.h" // DECL_COMMAND
+
+// Firmware-version marker so the host can confirm a fresh reflash carries
+// the latest phase-stepping fixes.  Bump this string when MCU code changes
+// in a way the host needs to detect.  Host reads via `MCU.get_constant`.
+DECL_CONSTANT_STR("PHASE_STEPPER_VER", "v8-eot-timeout-100us");
 #include "sched.h" // sched_add_timer
 #include "spicmds.h" // spidev_kick_dma_tx
 #include "trsync.h" // trsync_add_signal

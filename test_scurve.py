@@ -285,8 +285,12 @@ def test_phase_compressor():
     for s in range(num_seg):
         seg = segments[s]
         for i in range(seg.count):
-            reconstructed = seg.start_position + seg.velocity * i \
-                            + 0.5 * seg.acceleration * i * i
+            # MCU's per-tick emit formula: emit_i = start + i*vel
+            #   + i*(i-1)/2 * accel.  NOT the "physics" 0.5*a*t^2 form —
+            #   the i*(i-1)/2 reflects the discrete state-machine advance
+            #   (position += velocity each tick).
+            reconstructed = (seg.start_position + seg.velocity * i
+                             + 0.5 * seg.acceleration * i * (i - 1))
             error = abs(positions[sample_idx] - reconstructed)
             max_error = max(max_error, error)
             sample_idx += 1
@@ -324,8 +328,12 @@ def test_phase_compressor_sine():
     for s in range(num_seg):
         seg = segments[s]
         for i in range(seg.count):
-            reconstructed = seg.start_position + seg.velocity * i \
-                            + 0.5 * seg.acceleration * i * i
+            # MCU's per-tick emit formula: emit_i = start + i*vel
+            #   + i*(i-1)/2 * accel.  NOT the "physics" 0.5*a*t^2 form —
+            #   the i*(i-1)/2 reflects the discrete state-machine advance
+            #   (position += velocity each tick).
+            reconstructed = (seg.start_position + seg.velocity * i
+                             + 0.5 * seg.acceleration * i * (i - 1))
             error = abs(positions[sample_idx] - reconstructed)
             max_error = max(max_error, error)
             sample_idx += 1
