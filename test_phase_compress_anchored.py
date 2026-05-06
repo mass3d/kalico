@@ -90,21 +90,36 @@ def make_test_environment():
     return ffi_main, ffi_lib, pc
 
 
-def compress_anchored(ffi_main, ffi_lib, pc, positions, anchor):
-    """Wrap the C call and return a list of (start, vel, accel, count) tuples."""
+def compress_anchored_raw(ffi_main, ffi_lib, pc, positions, anchor, max_out=256):
+    """Wrap the C call and return (n_out, segment tuples).
+
+    n_out is negative when the compressor filled max_out before consuming all
+    samples.  That must be surfaced to the host so it can fault instead of
+    silently queuing a partial prefix.
+    """
     n = len(positions)
     pos_arr = ffi_main.new("double[]", n)
     for i, p in enumerate(positions):
         pos_arr[i] = p
-    out_arr = ffi_main.new("struct phase_mcu_move[]", 256)
+    out_arr = ffi_main.new("struct phase_mcu_move[]", max_out)
     n_out = ffi_lib.phase_compressor_compress_anchored(
-        pc, pos_arr, n, anchor, out_arr, 256
+        pc, pos_arr, n, anchor, out_arr, max_out
     )
-    return [
+    if n_out < 0:
+        return n_out, []
+    return n_out, [
         (out_arr[i].start_position, out_arr[i].velocity,
          out_arr[i].acceleration, out_arr[i].count)
         for i in range(n_out)
     ]
+
+
+def compress_anchored(ffi_main, ffi_lib, pc, positions, anchor):
+    """Return segment tuples, asserting that compression completed."""
+    n_out, segments = compress_anchored_raw(
+        ffi_main, ffi_lib, pc, positions, anchor)
+    assert n_out >= 0, f"compressor overflowed unexpectedly: n_out={n_out}"
+    return segments
 
 
 def verify_chain_continuity(segments, anchor):
@@ -297,6 +312,21 @@ def main():
         print("  PASS")
     finally:
         ffi_lib.phase_compressor_set_max_error(pc, 0.25)
+
+    # Test 9: output-cap overflow must be visible to the host.  Before this
+    # regression fix, the C helper returned max_out as if compression succeeded,
+    # so the host advanced generator time and queued only a partial prefix.
+    print("Test 9: segment-cap overflow returns a negative count")
+    anchor_d = 100.0
+    anchor = int(anchor_d * 65536)
+    positions = [anchor_d + 5.0, anchor_d + 5.5, anchor_d + 6.0]
+    n_out, segments = compress_anchored_raw(
+        ffi_main, ffi_lib, pc, positions, anchor, max_out=1)
+    assert n_out == -1, (
+        f"overflow with one emitted segment should return -1, got {n_out}")
+    assert segments == []
+    print("  -> overflow reported as n_out=-1, not a silent partial success")
+    print("  PASS")
 
     print()
     print("All tests passed.  phase_compressor_compress_anchored produces "

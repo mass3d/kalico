@@ -31,7 +31,7 @@
 // Firmware-version marker so the host can confirm a fresh reflash carries
 // the latest phase-stepping fixes.  Bump this string when MCU code changes
 // in a way the host needs to detect.  Host reads via `MCU.get_constant`.
-DECL_CONSTANT_STR("PHASE_STEPPER_VER", "v8-eot-timeout-100us");
+DECL_CONSTANT_STR("PHASE_STEPPER_VER", "v9-reset-armed");
 #include "sched.h" // sched_add_timer
 #include "spicmds.h" // spidev_kick_dma_tx
 #include "trsync.h" // trsync_add_signal
@@ -86,7 +86,10 @@ struct phase_move {
 };
 
 enum { PM_MODE_DIRECT_CURRENT = 0, PM_MODE_POSITION_TARGET = 1 };
-enum { PSF_NEED_RESET = 1<<0 };
+enum {
+    PSF_NEED_RESET = 1<<0,
+    PSF_RESET_ARMED = 1<<1,
+};
 
 struct tmc_phase_stepper {
     struct spidev_s *spi;
@@ -144,6 +147,42 @@ static struct {
 // Forward declarations
 static void bus_dma_done(void *ctx);
 static void kick_next_dma_in_bus(struct phase_bus_group *bg);
+
+static uint8_t
+group_has_armed_motors(void)
+{
+    for (uint8_t b = 0; b < group_isr.bus_count; b++) {
+        struct phase_bus_group *bg = &group_isr.buses[b];
+        for (uint8_t i = 0; i < bg->motor_count; i++) {
+            struct tmc_phase_stepper *ps = bg->motors[i];
+            if (ps && !(ps->flags & PSF_NEED_RESET))
+                return 1;
+        }
+    }
+    return 0;
+}
+
+static void
+clear_pending_dma_chains(void)
+{
+    for (uint8_t b = 0; b < MAX_BUSES; b++) {
+        group_isr.buses[b].pending_count = 0;
+        group_isr.buses[b].cur_motor = 0;
+    }
+}
+
+static void
+phase_group_stop_if_unarmed(void)
+{
+    if (group_has_armed_motors())
+        return;
+    clear_pending_dma_chains();
+    if (group_isr.active) {
+        sched_del_timer(&group_isr.timer);
+        group_isr.active = 0;
+    }
+    group_isr.interval = 0;
+}
 
 // Build one motor's 5-byte XDIRECT message into the bus's tx_buf at the
 // given byte offset.  Returns the next byte offset.  Always emits — the
@@ -207,6 +246,12 @@ phase_stepper_advance(struct tmc_phase_stepper *ps)
 static uint_fast8_t
 group_phase_stepper_event(struct timer *t)
 {
+    if (!group_has_armed_motors()) {
+        clear_pending_dma_chains();
+        group_isr.active = 0;
+        group_isr.interval = 0;
+        return SF_DONE;
+    }
     group_isr.group_tick_count++;
     for (uint8_t b = 0; b < group_isr.bus_count; b++) {
         struct phase_bus_group *bg = &group_isr.buses[b];
@@ -404,12 +449,23 @@ command_queue_phase_move(uint32_t *args)
     uint32_t interval = args[1];
     irq_disable();
     if (ps->flags & PSF_NEED_RESET) {
-        // Motor not armed — host must call reset_phase_clock first.
+        if (!(ps->flags & PSF_RESET_ARMED)) {
+            // Motor not armed — host must call reset_phase_clock first.
+            move_free(pm);
+            irq_enable();
+            return;
+        }
+        // First segment after reset: load it while the motor is still masked
+        // from the ISR, then arm the motor atomically.  This prevents a reset
+        // clock from re-enabling stale phase output before the first segment
+        // reaches the MCU.
+        ps->position = pm->start_position;
+        ps->velocity = pm->velocity;
+        ps->acceleration = pm->acceleration;
+        ps->count = pm->count;
+        ps->flags &= ~(PSF_NEED_RESET | PSF_RESET_ARMED);
         move_free(pm);
-        irq_enable();
-        return;
-    }
-    if (ps->count) {
+    } else if (ps->count) {
         // Currently running a segment — queue this one.
         move_queue_push(&pm->node, &ps->mq);
     } else {
@@ -445,7 +501,7 @@ reset_one_motor_locked(struct tmc_phase_stepper *ps)
         struct phase_move *pm = container_of(mn, struct phase_move, node);
         move_free(pm);
     }
-    ps->flags &= ~PSF_NEED_RESET;
+    ps->flags |= PSF_NEED_RESET | PSF_RESET_ARMED;
 }
 
 // reset_phase_clock oid=%c clock=%u
@@ -458,6 +514,7 @@ command_reset_phase_clock(uint32_t *args)
     uint32_t waketime = args[1];
     irq_disable();
     reset_one_motor_locked(ps);
+    phase_group_stop_if_unarmed();
     if (!group_isr.active) {
         group_isr.timer.waketime = waketime;
         group_isr.group_tick_count = 0;
@@ -486,6 +543,7 @@ command_reset_phase_clock_group(uint32_t *args)
             oids[i], command_config_tmc_phase_stepper);
         reset_one_motor_locked(ps);
     }
+    phase_group_stop_if_unarmed();
     if (!group_isr.active) {
         group_isr.timer.waketime = waketime;
         group_isr.group_tick_count = 0;
@@ -512,6 +570,7 @@ command_stop_phase_stepper(uint32_t *args)
         struct phase_move *pm = container_of(mn, struct phase_move, node);
         move_free(pm);
     }
+    phase_group_stop_if_unarmed();
     // Leave XDIRECT at its last held value — the host clears GCONF.direct_mode
     // separately, which restores normal step/dir behavior.
     irq_enable();
@@ -553,6 +612,7 @@ phase_stepper_stop(struct trsync_signal *tss, uint8_t reason)
         struct phase_move *pm = container_of(mn, struct phase_move, node);
         move_free(pm);
     }
+    phase_group_stop_if_unarmed();
     // Leave XDIRECT held; host restores GCONF.
 }
 
