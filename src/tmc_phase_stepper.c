@@ -31,7 +31,7 @@
 // Firmware-version marker so the host can confirm a fresh reflash carries
 // the latest phase-stepping fixes.  Bump this string when MCU code changes
 // in a way the host needs to detect.  Host reads via `MCU.get_constant`.
-DECL_CONSTANT_STR("PHASE_STEPPER_VER", "v9-reset-armed");
+DECL_CONSTANT_STR("PHASE_STEPPER_VER", "v10-polled-spi-default");
 #include "sched.h" // sched_add_timer
 #include "spicmds.h" // spidev_kick_dma_tx
 #include "trsync.h" // trsync_add_signal
@@ -106,7 +106,8 @@ struct tmc_phase_stepper {
     struct trsync_signal stop_signal;
     // Diagnostics
     uint32_t event_count;        // ISR ticks processed for this motor
-    uint32_t write_count;        // SPI bytes written for this motor (= 5*event_count)
+    uint32_t write_count;        // accepted SPI write bursts for this motor
+    uint32_t skip_count;         // write drops / stale pending chains
     uint16_t last_phase;
     int32_t last_emitted_position;
 };
@@ -267,6 +268,7 @@ group_phase_stepper_event(struct timer *t)
                 struct tmc_phase_stepper *ps = bg->motors[i];
                 if (ps && !(ps->flags & PSF_NEED_RESET)) {
                     ps->event_count++;
+                    ps->skip_count++;
                     phase_stepper_advance(ps);
                 }
             }
@@ -318,6 +320,12 @@ kick_next_dma_in_bus(struct phase_bus_group *bg)
                                 bus_dma_done, bg);
     if (rc != 0) {
         // Bus contention — drop this and remaining motors for this tick.
+        for (uint8_t i = bg->cur_motor; i < bg->pending_count; i++) {
+            uint8_t skipped_idx = bg->pending_motors[i];
+            struct tmc_phase_stepper *skipped = bg->motors[skipped_idx];
+            if (skipped)
+                skipped->skip_count++;
+        }
         bg->pending_count = 0;
         bg->cur_motor = 0;
         return;
@@ -587,12 +595,13 @@ command_get_phase_stepper_status(uint32_t *args)
     irq_disable();
     uint32_t event_count = ps->event_count;
     uint32_t write_count = ps->write_count;
+    uint32_t skip_count = ps->skip_count;
     uint16_t last_phase = ps->last_phase;
     int32_t position = ps->position;
     irq_enable();
     sendf("phase_stepper_status oid=%c event_count=%u write_count=%u"
           " skip_count=%u last_phase=%hu position=%i",
-          oid, event_count, write_count, 0, last_phase, position);
+          oid, event_count, write_count, skip_count, last_phase, position);
 }
 DECL_COMMAND(command_get_phase_stepper_status,
              "get_phase_stepper_status oid=%c");

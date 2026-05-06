@@ -157,7 +157,7 @@ spidev_transfer_prepared(struct spidev_s *spi, uint8_t data_len,
 // DMA fire-and-forget transfer.  Caller manages CS via the cb (called
 // from the DMA-TC IRQ).  See spicmds.h for full semantics.
 // =====================================================================
-#if CONFIG_WANT_SPI_DMA
+#if CONFIG_WANT_SPI_DMA && CONFIG_PHASE_STEPPER_EXPERIMENTAL_DMA
 // Board-level primitive — defined in stm32h7_spi.c.  Declared locally
 // with `void *` to avoid pulling stm32h7xx.h into this file.
 extern int spi_dma_kick_tx(void *spi, uint8_t *tx_buf, uint16_t len,
@@ -225,14 +225,11 @@ spidev_dma_in_flight(struct spidev_s *spi)
     return spi_dma_is_inflight(spi->spi_config.spi);
 }
 #else
-// Polled fallback: no DMA on this board.  Defer to `spidev_transfer`,
-// the exact same code path as `command_spi_send` (and therefore the
-// same path Klipper's standard TMC register writes use).  The earlier
-// hand-rolled implementation duplicated that logic but had subtle
-// differences (CS ordering, no SF_HARDWARE/SF_SOFTWARE flag check)
-// that made phase-stepping per-tick bursts diverge from the proven
-// path — the `spidev_kick_dma_tx` writes would not land at the TMC
-// even though the SPI clock was driven.
+// Polled fallback: use the exact same code path as command_spi_send and
+// normal Klipper TMC register writes.  This is intentionally the default
+// until the H7 DMA chain is proven on real hardware; the field symptom for
+// a wedged DMA chain is event_count advancing while XDIRECT readback stays
+// unchanged.
 int
 spidev_kick_dma_tx(struct spidev_s *spi, uint8_t *tx_buf, uint16_t len,
                    spi_dma_done_fn cb, void *ctx)
