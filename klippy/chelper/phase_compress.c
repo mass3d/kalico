@@ -206,7 +206,9 @@ mirror_advance(int32_t start, int32_t vel, int32_t accel, uint16_t count)
 // construction: every emitted XDIRECT phase is continuous from the previous
 // one, regardless of float drift in the trapq sample stream.
 //
-// Returns number of MCU moves written.
+// Returns number of MCU moves written.  Returns a negative count if the output
+// buffer filled before all samples were consumed; callers must treat that as a
+// hard failure because queuing the partial prefix would silently drop motion.
 int __visible
 phase_compressor_compress_anchored(struct phase_compressor *pc
                                    , double *positions, int num_samples
@@ -300,6 +302,8 @@ phase_compressor_compress_anchored(struct phase_compressor *pc
         start += best_len;
     }
 
+    if (start < num_samples)
+        return out_count ? -out_count : -1;
     return out_count;
 }
 

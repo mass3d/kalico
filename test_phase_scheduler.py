@@ -70,6 +70,21 @@ class ContinuousIdleMCUMotor:
 
 
 @dataclass
+class ResetArmedMCUMotor:
+    name: str
+    need_reset: bool = True
+    reset_armed: bool = False
+    count: int = 0
+    position: int = 0
+    emitted: Optional[list] = None
+    accepted_batches: int = 0
+
+    def __post_init__(self):
+        if self.emitted is None:
+            self.emitted = []
+
+
+@dataclass
 class ScheduledMotor:
     name: str
     interval: int = 0
@@ -358,6 +373,83 @@ class IndependentScheduler:
                 motor.next_clock += motor.interval
             else:
                 motor.next_clock = None
+        return True
+
+
+class ResetArmedPhaseGroup:
+    """Small model of src/tmc_phase_stepper.c reset/arm semantics.
+
+    reset_phase_clock must not unmask stale position output.  It should mark
+    a motor as reset-armed, and the first queue_phase_move must atomically load
+    the new segment before clearing NEED_RESET.
+    """
+
+    def __init__(self, motors):
+        self.motors = {motor.name: motor for motor in motors}
+        self.active = False
+        self.interval = 0
+        self.waketime = 0
+
+    def has_armed_motors(self):
+        return any(not motor.need_reset for motor in self.motors.values())
+
+    def stop_if_unarmed(self):
+        if self.has_armed_motors():
+            return
+        self.active = False
+        self.interval = 0
+
+    def reset(self, name, clock):
+        motor = self.motors[name]
+        motor.count = 0
+        motor.need_reset = True
+        motor.reset_armed = True
+        self.stop_if_unarmed()
+        if not self.active:
+            self.waketime = clock
+
+    def stop(self, name):
+        motor = self.motors[name]
+        motor.count = 0
+        motor.need_reset = True
+        motor.reset_armed = False
+        self.stop_if_unarmed()
+
+    def queue(self, name, interval, start_position, count):
+        motor = self.motors[name]
+        if motor.need_reset:
+            if not motor.reset_armed:
+                return False
+            motor.position = start_position
+            motor.count = count
+            motor.need_reset = False
+            motor.reset_armed = False
+            motor.accepted_batches += 1
+        elif motor.count:
+            motor.accepted_batches += 1
+        else:
+            motor.position = start_position
+            motor.count = count
+            motor.accepted_batches += 1
+        if self.interval == 0:
+            self.interval = interval
+        if not self.active:
+            self.active = True
+        return True
+
+    def event(self):
+        if not self.active:
+            return False
+        if not self.has_armed_motors():
+            self.stop_if_unarmed()
+            return False
+        for motor in self.motors.values():
+            if motor.need_reset:
+                continue
+            motor.emitted.append(motor.position)
+            if motor.count:
+                motor.count -= 1
+        self.waketime += self.interval
         return True
 
 
@@ -715,6 +807,82 @@ def test_diagnostic_boundary_forces_reset_before_resume():
     print("PASS: diagnostic stop forces a reset before resume")
 
 
+def test_reset_clock_masks_motor_until_first_segment_is_loaded():
+    x = ResetArmedMCUMotor(
+        name="X", need_reset=False, position=1111, count=0)
+    y = ResetArmedMCUMotor(
+        name="Y", need_reset=False, position=2222, count=2)
+    group = ResetArmedPhaseGroup([x, y])
+    group.active = True
+    group.interval = 100
+    group.waketime = 1000
+
+    group.reset("X", clock=5000)
+    assert group.active, "the group remains active because Y is still armed"
+    assert x.need_reset and x.reset_armed
+
+    assert group.event()
+    assert x.emitted == [], \
+        "reset-armed motor must not emit stale position while waiting for queue"
+    assert y.emitted == [2222]
+
+    assert group.queue("X", interval=100, start_position=3333, count=1)
+    assert not x.need_reset and not x.reset_armed
+    assert group.event()
+    assert x.emitted == [3333], \
+        "first post-reset emission must be the newly queued segment start"
+    print("PASS: reset clock masks a motor until its first segment is loaded")
+
+
+def test_reset_clock_stops_idle_group_and_honors_new_waketime():
+    x = ResetArmedMCUMotor(
+        name="X", need_reset=False, position=1111, count=0)
+    group = ResetArmedPhaseGroup([x])
+    group.active = True
+    group.interval = 100
+    group.waketime = 1200
+
+    group.reset("X", clock=5000)
+
+    assert not group.active, \
+        "when all motors are reset-masked the shared timer must stop"
+    assert group.interval == 0
+    assert group.waketime == 5000, \
+        "reset while idle must install the requested reset_phase_clock waketime"
+    assert not group.event()
+    assert x.emitted == [], "no stale phase should emit between reset and queue"
+
+    assert group.queue("X", interval=80, start_position=4444, count=1)
+    assert group.active
+    assert group.interval == 80
+    assert group.waketime == 5000
+    assert group.event()
+    assert x.emitted == [4444]
+    print("PASS: reset clock stops an idle group and preserves the new waketime")
+
+
+def test_stop_requires_explicit_reset_before_queueing_again():
+    x = ResetArmedMCUMotor(
+        name="X", need_reset=False, position=1111, count=0)
+    group = ResetArmedPhaseGroup([x])
+    group.active = True
+    group.interval = 100
+    group.waketime = 1200
+
+    group.stop("X")
+    assert not group.active
+    assert group.interval == 0
+    assert x.need_reset and not x.reset_armed
+    assert not group.queue("X", interval=100, start_position=2222, count=1), \
+        "stop_phase_stepper should require reset_phase_clock before new motion"
+
+    group.reset("X", clock=6000)
+    assert group.queue("X", interval=100, start_position=2222, count=1)
+    assert group.event()
+    assert x.emitted == [2222]
+    print("PASS: stopped phase steppers require an explicit reset before queue")
+
+
 def test_global_cadence_starts_future_motor_too_early():
     broken = GlobalCadenceScheduler()
     fixed = IndependentScheduler()
@@ -983,6 +1151,9 @@ def main():
         test_explicit_idle_boundary_requires_new_clock_anchor,
         test_idle_boundary_forces_reset_before_resume,
         test_diagnostic_boundary_forces_reset_before_resume,
+        test_reset_clock_masks_motor_until_first_segment_is_loaded,
+        test_reset_clock_stops_idle_group_and_honors_new_waketime,
+        test_stop_requires_explicit_reset_before_queueing_again,
         test_global_cadence_starts_future_motor_too_early,
         test_global_cadence_shifts_resumed_motor_to_wrong_tick,
         test_homing_move_end_does_not_resume_inside_home_rails,

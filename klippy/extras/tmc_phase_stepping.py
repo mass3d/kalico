@@ -13,7 +13,7 @@ PHASE_ACTIVE_TPOWERDOWN = 255
 # so deploys can be verified via klippy.log.  MCU firmware version is
 # tracked separately via the PHASE_STEPPER_VER constant in
 # src/tmc_phase_stepper.c (queryable through MCU_constants).
-HOST_PHASE_STEPPER_VER = "v9-pair-generator-sync"
+HOST_PHASE_STEPPER_VER = "v10-compress-cap-fault"
 
 # Maximum number of position samples per flush cycle.
 # At the default 10kHz update rate, 32768 samples cover ~3.28s. Real AWD logs
@@ -886,6 +886,17 @@ class MCU_phase_stepper:
         num_mcu = ffi_lib.phase_compressor_compress_anchored(
             self._phase_compressor, self._positions, n,
             self._mcu_anchor_pos, self._mcu_moves, MAX_PHASE_SEGMENTS)
+        if num_mcu < 0:
+            written = -num_mcu
+            reason = ("phase compression segment cap hit: samples=%d"
+                      " partial_segments=%d cap=%d"
+                      % (n, written, MAX_PHASE_SEGMENTS))
+            self._trace_event('compress_cap', flush=flush_time, samples=n,
+                              partial_segments=written,
+                              cap=MAX_PHASE_SEGMENTS)
+            logging.warning("Phase stepping %s: %s", self.name, reason)
+            self._report_fault(reason)
+            return
         if num_mcu <= 0:
             logging.info(
                 "Phase stepping %s: emit num_mcu=0 n=%d flush_time=%.6f"
