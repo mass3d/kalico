@@ -229,6 +229,18 @@ def phase_active_policy(policy, active_tpowerdown=255,
     )
 
 
+def spi_phase_bus_load(motor_count, update_rate, spi_rate,
+                       bytes_per_motor=5):
+    return motor_count * bytes_per_motor * 8.0 * update_rate / spi_rate
+
+
+def polled_spi_safe_update_rate(spi_rates, target_load=0.20,
+                                bytes_per_motor=5):
+    seconds_per_tick = sum(bytes_per_motor * 8.0 / rate
+                           for rate in spi_rates)
+    return math.floor(target_load / seconds_per_tick)
+
+
 def activation_preload(mscnt, live_cur_a, live_cur_b):
     if live_cur_a or live_cur_b:
         return live_cur_a, live_cur_b, "mscuract"
@@ -504,6 +516,17 @@ def recent_idle_tail_start(flush_time, idle_lookback, resume_lookback):
     return max(0.0, flush_time - max(idle_lookback, resume_lookback))
 
 
+def idle_catchup_start(phase_gen_time, now_print_time, flush_time,
+                       last_emit_motion, min_buffer=0.05,
+                       stale_threshold=0.250):
+    safe_start = now_print_time + min_buffer
+    stale_time = safe_start - phase_gen_time
+    if (not last_emit_motion and stale_time > stale_threshold
+            and safe_start < flush_time):
+        return safe_start, True
+    return phase_gen_time, False
+
+
 def sample_positions(last_flush_time, flush_time, interval, max_samples,
                      hold_position, move_start, velocity):
     positions = []
@@ -688,6 +711,44 @@ def test_long_idle_flush_rechecks_recent_tail_before_declaring_standstill():
     assert abs(recent_tail[0] - hold_position) < 0.5, recent_tail[:5]
     print("PASS: long idle standstill flushes recheck the recent tail so a"
           " completed move is not skipped")
+
+
+def test_idle_catchup_skips_elapsed_hold_backlog_before_new_move():
+    phase_gen_time = 157.556
+    now_print_time = 165.300
+    flush_time = 165.650
+    move_start = 165.450
+    interval = 0.010
+
+    catchup_start, skipped = idle_catchup_start(
+        phase_gen_time, now_print_time, flush_time, last_emit_motion=False)
+    before = sample_positions(
+        last_flush_time=phase_gen_time, flush_time=flush_time,
+        interval=interval, max_samples=1000, hold_position=1000.0,
+        move_start=move_start, velocity=400.0)
+    after = sample_positions(
+        last_flush_time=catchup_start, flush_time=flush_time,
+        interval=interval, max_samples=1000, hold_position=1000.0,
+        move_start=move_start, velocity=400.0)
+
+    assert skipped
+    assert abs(catchup_start - 165.350) < 0.000001, catchup_start
+    assert find_move_start(before, 0.5) > 700, \
+        "old logic queues seconds of already-elapsed held phase"
+    assert find_move_start(after, 0.5) < 20, \
+        "catch-up starts near fresh motion instead of replaying idle"
+    print("PASS: idle catch-up skips elapsed hold backlog before a new move")
+
+
+def test_idle_catchup_preserves_motion_and_short_buffers():
+    assert not idle_catchup_start(
+        157.556, 165.300, 165.650, last_emit_motion=True)[1]
+    assert not idle_catchup_start(
+        10.000, 10.100, 10.400, last_emit_motion=False)[1]
+    assert not idle_catchup_start(
+        10.000, 11.000, 11.040, last_emit_motion=False)[1]
+    print("PASS: idle catch-up does not skip active motion, short stale"
+          " gaps, or insufficient flush buffers")
 
 
 def test_natural_idle_does_not_need_host_hold_padding():
@@ -1076,6 +1137,23 @@ def test_phase_active_policy_does_not_mutate_cached_driver_settings():
           " for restore")
 
 
+def test_shared_spi_bus_needs_headroom_at_high_phase_rates():
+    assert spi_phase_bus_load(4, 25000, 4000000) == 1.0
+    assert spi_phase_bus_load(4, 25000, 8000000) == 0.5
+    assert spi_phase_bus_load(4, 10000, 4000000) == 0.4
+    print("PASS: shared SPI bus load check captures 25kHz four-motor"
+          " bandwidth limits")
+
+
+def test_polled_spi_rate_guard_caps_shared_four_motor_rate():
+    assert polled_spi_safe_update_rate([4000000] * 4) == 5000
+    assert polled_spi_safe_update_rate([8000000] * 4) == 10000
+    assert spi_phase_bus_load(4, 5000, 4000000) == 0.2
+    assert spi_phase_bus_load(4, 10000, 8000000) == 0.2
+    print("PASS: polled SPI rate guard limits four-motor phase stepping"
+          " to 20% raw bus load")
+
+
 def test_activation_preload_prefers_live_current_vector():
     preload_a, preload_b, source = activation_preload(508, -17, 245)
     assert (preload_a, preload_b, source) == (-17, 245, "mscuract")
@@ -1144,6 +1222,8 @@ def main():
         test_natural_idle_flush_preserves_held_phase_on_resume,
         test_resume_retry_rewinds_to_recent_idle_history,
         test_long_idle_flush_rechecks_recent_tail_before_declaring_standstill,
+        test_idle_catchup_skips_elapsed_hold_backlog_before_new_move,
+        test_idle_catchup_preserves_motion_and_short_buffers,
         test_natural_idle_does_not_need_host_hold_padding,
         test_pre_move_idle_keeps_clock_reset_armed,
         test_natural_idle_keeps_mcu_hold_active_without_reset,
@@ -1168,6 +1248,8 @@ def main():
         test_external_beacon_flow_suppresses_homing_auto_resume,
         test_phase_active_policy_keeps_run_current_and_delays_powerdown,
         test_phase_active_policy_does_not_mutate_cached_driver_settings,
+        test_shared_spi_bus_needs_headroom_at_high_phase_rates,
+        test_polled_spi_rate_guard_caps_shared_four_motor_rate,
         test_activation_preload_prefers_live_current_vector,
         test_phase_from_currents_roundtrips_logged_activation_vectors,
         test_phase_position_to_mcu_phase_matches_fixed_point_wrap,

@@ -13,14 +13,20 @@ PHASE_ACTIVE_TPOWERDOWN = 255
 # so deploys can be verified via klippy.log.  MCU firmware version is
 # tracked separately via the PHASE_STEPPER_VER constant in
 # src/tmc_phase_stepper.c (queryable through MCU_constants).
-HOST_PHASE_STEPPER_VER = "v10-compress-cap-fault"
+HOST_PHASE_STEPPER_VER = "v13-polled-rate-guard"
+
+DEFAULT_PHASE_UPDATE_RATE = 5000.
+PHASE_SPI_BYTES_PER_MOTOR = 5
+POLLED_SPI_TARGET_LOAD = 0.20
+MIN_PHASE_UPDATE_RATE = 1000.
 
 # Maximum number of position samples per flush cycle.
-# At the default 10kHz update rate, 32768 samples cover ~3.28s. Real AWD logs
-# showed the first resumed flush arriving ~1.25s after motion started; with the
-# default 0.5s idle lookback, 16384 samples (~1.64s) was still too short and
-# the host queued the move from mid-trajectory. 32768 leaves headroom for that
-# long first-flush latency while keeping the whole resume on the host side.
+# At the default 5kHz update rate, 32768 samples cover ~6.55s. Earlier 10kHz
+# logs showed the first resumed flush arriving ~1.25s after motion started;
+# with the default 0.5s idle lookback, 16384 samples (~1.64s) was still too
+# short and the host queued the move from mid-trajectory. 32768 leaves
+# headroom for that long first-flush latency while keeping the whole resume on
+# the host side.
 MAX_PHASE_SAMPLES = 32768
 # Maximum number of compressed segments emitted per motor per flush.
 # Each emitted segment consumes one node in the MCU's shared move_alloc pool
@@ -126,9 +132,15 @@ class MCU_phase_stepper:
         self.name = config.get_name()
         self.mcu = stepper.get_mcu()
         self.oid = self.mcu.create_oid()
-        self.update_rate = config.getfloat('phase_update_rate', 25000.,
-                                           above=1000., maxval=50000.)
+        self._configured_update_rate = config.getfloat(
+            'phase_update_rate', DEFAULT_PHASE_UPDATE_RATE,
+            above=MIN_PHASE_UPDATE_RATE, maxval=50000.)
+        self.update_rate = self._configured_update_rate
+        self._effective_rate_reason = 'configured'
         self.update_interval = 1. / self.update_rate
+        self._phase_spi_max_bus_load = config.getfloat(
+            'phase_spi_max_bus_load', POLLED_SPI_TARGET_LOAD,
+            minval=0.05, maxval=0.50)
         self.phase_bus = config.getint('phase_bus', 0, minval=0, maxval=3)
         self.active_tpowerdown = config.getint(
             'phase_active_tpowerdown', PHASE_ACTIVE_TPOWERDOWN,
@@ -149,6 +161,7 @@ class MCU_phase_stepper:
         # bit-exact.
         self._mcu_anchor_pos = 0
         self._mcu_anchor_clock = 0
+        self._phase_gen_time = 0.
         # AWD pair partnership (set by TMCPhaseStepping._resolve_pairs).
         self._pair_partner = None
         self._pair_reset_consumed_clock = None
@@ -299,6 +312,10 @@ class MCU_phase_stepper:
             pass
     def set_fault_handler(self, cb):
         self._fault_handler = cb
+    def set_effective_update_rate(self, rate, reason):
+        self.update_rate = rate
+        self.update_interval = 1. / rate
+        self._effective_rate_reason = reason
     def _trace_event(self, kind, **fields):
         entry = {'kind': kind}
         entry.update(fields)
@@ -344,7 +361,8 @@ class MCU_phase_stepper:
         cur_a, cur_b, preload_source = _activation_preload_currents(
             mscnt, mscuract_raw)
         # GCONF: direct_mode=1, SpreadCycle (en_pwm_mode=0).  StealthChop's
-        # auto-regulation can't track at 10kHz and falls back to MSLUT.
+        # auto-regulation can't reliably track direct-current phase updates
+        # and falls back to MSLUT.
         gconf_val = self._saved_gconf
         gconf_val |= (1 << 16)   # direct_mode
         gconf_val &= ~(1 << 2)   # SpreadCycle (clear en_pwm_mode)
@@ -618,6 +636,7 @@ class MCU_phase_stepper:
             self.printer.get_reactor().monotonic())
         self._ffi_lib.phase_generator_set_time(
             self._phase_generator, current_print_time)
+        self._phase_gen_time = current_print_time
         # Seed the generator's "held position" to the activate-time phase so
         # samples taken in pre-move windows (e.g. between activate and the
         # first G1 after an idle gap) return the held phase via the
@@ -833,6 +852,7 @@ class MCU_phase_stepper:
                 return
             ffi_lib.phase_generator_set_time(
                 self._phase_generator, safe_start)
+            self._phase_gen_time = safe_start
             # Pair atomicity: when this motor emits its reset_phase_clock,
             # `_emit_reset_clock` will clear the partner's _needs_clock_reset
             # so the partner's generate_and_queue skips this first-emit
@@ -846,6 +866,39 @@ class MCU_phase_stepper:
             if self._pair_partner is not None:
                 ffi_lib.phase_generator_set_time(
                     self._pair_partner._phase_generator, safe_start)
+                self._pair_partner._phase_gen_time = safe_start
+        else:
+            # If the printer has been idle, the MCU has already spent that
+            # real time continuously emitting the held XDIRECT phase.  Do not
+            # enqueue the elapsed idle gap as hold segments on the next move:
+            # that creates a backlog where the MCU waits through the old idle
+            # before reaching fresh motion.  Keep a short command-latency
+            # buffer, then sample from there to the requested flush_time.
+            reactor = self.printer.get_reactor()
+            now_pt = self.mcu.estimated_print_time(reactor.monotonic())
+            min_buffer = 0.050
+            safe_clock = (self.mcu.print_time_to_clock(now_pt)
+                          + self.mcu.seconds_to_clock(min_buffer))
+            safe_start = self.mcu.clock_to_print_time(safe_clock)
+            stale_time = safe_start - self._phase_gen_time
+            if (not self._last_emit_motion and stale_time > 0.250
+                    and safe_start < flush_time):
+                logging.info(
+                    "Phase stepping %s: idle_catchup_skip"
+                    " old_gen_time=%.6f safe_start=%.6f flush_time=%.6f"
+                    " stale_time=%.6f anchor=0x%08x",
+                    self.name, self._phase_gen_time, safe_start, flush_time,
+                    stale_time, self._mcu_anchor_pos)
+                self._trace_event('idle_catchup_skip',
+                                  old_gen_time=self._phase_gen_time,
+                                  safe_start=safe_start,
+                                  flush_time=flush_time,
+                                  stale_time=stale_time,
+                                  anchor=self._mcu_anchor_pos)
+                ffi_lib.phase_generator_set_time(
+                    self._phase_generator, safe_start)
+                self._phase_gen_time = safe_start
+                self._mcu_anchor_clock = safe_clock
         # Sample positions for [last_flush_time .. flush_time].
         n = ffi_lib.phase_generator_generate(
             self._phase_generator, flush_time, self._samples,
@@ -871,6 +924,7 @@ class MCU_phase_stepper:
                 self._report_fault("repeated non-finite phase samples")
             return
         self._invalid_flush_count = 0
+        self._phase_gen_time = self._samples[0].time + n * self.update_interval
         # On the very first flush after activate, the mirror anchor was set
         # to the preloaded XDIRECT phase but the anchor clock is 0 — set it
         # now to the first sample's clock so reset_phase_clock points at the
@@ -1007,6 +1061,63 @@ class TMCPhaseStepping:
                                desc="Query phase stepper diagnostics")
         gcode.register_command('TEST_XDIRECT', self.cmd_TEST_XDIRECT,
                                desc="Manual XDIRECT test on first stepper")
+    def _phase_spi_speed(self, ps):
+        try:
+            return float(ps.tmc_obj.mcu_tmc.tmc_spi.spi.speed)
+        except Exception:
+            return None
+    def _apply_update_rate_guard(self):
+        if not self.phase_steppers:
+            return
+        by_mcu = {}
+        for ps in self.phase_steppers.values():
+            by_mcu.setdefault(ps.mcu, []).append(ps)
+        for mcu, steppers in by_mcu.items():
+            configured = min(ps._configured_update_rate for ps in steppers)
+            if any(ps._configured_update_rate != configured for ps in steppers):
+                logging.warning(
+                    "Phase stepping: all motors on MCU %s share one"
+                    " firmware timer; using the lowest configured"
+                    " phase_update_rate %.0fHz for %d motors.",
+                    mcu.get_name(), configured, len(steppers))
+            target_load = min(ps._phase_spi_max_bus_load for ps in steppers)
+            seconds_per_tick = 0.
+            unknown_speed = False
+            for ps in steppers:
+                spi_speed = self._phase_spi_speed(ps)
+                if spi_speed is None or spi_speed <= 0.:
+                    spi_speed = 4000000.
+                    unknown_speed = True
+                seconds_per_tick += PHASE_SPI_BYTES_PER_MOTOR * 8. / spi_speed
+            max_rate = target_load / seconds_per_tick
+            safe_rate = max(MIN_PHASE_UPDATE_RATE, math.floor(max_rate))
+            effective = min(configured, safe_rate)
+            raw_load = configured * seconds_per_tick
+            eff_load = effective * seconds_per_tick
+            reason = 'configured'
+            if effective < configured:
+                reason = 'spi_load_guard'
+                logging.warning(
+                    "Phase stepping: limiting MCU %s phase_update_rate"
+                    " from %.0fHz to %.0fHz for %d motors."
+                    " Raw polled SPI load would be %.0f%%; target is %.0f%%."
+                    " Increase the TMC spi_speed to allow a higher rate.",
+                    mcu.get_name(), configured, effective, len(steppers),
+                    raw_load * 100., target_load * 100.)
+            else:
+                logging.info(
+                    "Phase stepping: MCU %s phase_update_rate %.0fHz uses"
+                    " %.0f%% raw polled SPI load for %d motors"
+                    " (target %.0f%%).",
+                    mcu.get_name(), effective, eff_load * 100.,
+                    len(steppers), target_load * 100.)
+            if unknown_speed:
+                logging.warning(
+                    "Phase stepping: could not read one or more TMC SPI"
+                    " speeds on MCU %s; assuming 4MHz for rate guard.",
+                    mcu.get_name())
+            for ps in steppers:
+                ps.set_effective_update_rate(effective, reason)
     def _resolve_pairs(self):
         """Wire each MCU_phase_stepper's _pair_partner pointer based on the
         phase_pair config.  Called once before first activate."""
@@ -1032,6 +1143,7 @@ class TMCPhaseStepping:
         if self._phase_stepping_enabled:
             return
         self._resolve_pairs()
+        self._apply_update_rate_guard()
         for name, ps in self.phase_steppers.items():
             ps.activate()
         self._phase_stepping_enabled = True
@@ -1265,7 +1377,8 @@ class TMCPhaseStepping:
                     gcmd.respond_info("%s probe failed: %s" % (name, e))
             gcmd.respond_info(
                 "%s: active=%s needs_reset=%s"
-                " update_hz=%.0f phase_bus=%d"
+                " update_hz=%.0f configured_update_hz=%.0f"
+                " rate_source=%s phase_bus=%d"
                 " anchor_pos=0x%08x anchor_clock=%d"
                 " sample_window=%.3f"
                 " max_error=%.3f"
@@ -1287,7 +1400,8 @@ class TMCPhaseStepping:
                 " pair_partner=%s" % (
                     name, ps._phase_stepping_active,
                     ps._needs_clock_reset,
-                    ps.update_rate, ps.phase_bus,
+                    ps.update_rate, ps._configured_update_rate,
+                    ps._effective_rate_reason, ps.phase_bus,
                     ps._mcu_anchor_pos & 0xFFFFFFFF,
                     ps._mcu_anchor_clock,
                     (MAX_PHASE_SAMPLES - 1) * ps.update_interval,

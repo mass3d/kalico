@@ -158,7 +158,7 @@ spi_transfer(struct spi_config config, uint8_t receive_data,
     spi->CR1 = SPI_CR1_SSI;
 }
 
-#if CONFIG_WANT_SPI_DMA
+#if CONFIG_WANT_SPI_DMA && CONFIG_PHASE_STEPPER_EXPERIMENTAL_DMA
 // =====================================================================
 // DMA-driven fire-and-forget SPI TX path.
 // Used by tmc_phase_stepper.c group ISR.  Allocates one DMA1 stream per
@@ -430,4 +430,4 @@ spi_dma_is_inflight(void *spi_void)
     struct spi_dma_state *st = spi_dma_state_for(spi);
     return st ? st->inflight : 0;
 }
-#endif // CONFIG_WANT_SPI_DMA
+#endif // CONFIG_WANT_SPI_DMA && CONFIG_PHASE_STEPPER_EXPERIMENTAL_DMA

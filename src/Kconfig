@@ -115,20 +115,23 @@ config WANT_SOFTWARE_SPI
     depends on HAVE_GPIO
     default y if HAVE_GPIO
 config WANT_SPI_DMA
-    bool "Use DMA SPI for phase stepping"
+    bool "Build DMA SPI support for phase stepping"
     depends on WANT_SPI && HAVE_DMA_BUF_REGION
     default y if HAVE_DMA_BUF_REGION
     help
-      Enable fire-and-forget DMA SPI transfers for the phase-stepping
-      group ISR.  Required for sustained update rates above ~10 kHz with
-      multiple motors.  Currently implemented for STM32H7.
-config PHASE_STEPPER_DMA
-    bool "Use the DMA-driven group ISR for phase stepping"
+      Build the fire-and-forget DMA SPI primitive used by the experimental
+      phase-stepping write path.  The default runtime path remains the
+      proven polled SPI transfer path unless PHASE_STEPPER_EXPERIMENTAL_DMA
+      is explicitly enabled.
+config PHASE_STEPPER_EXPERIMENTAL_DMA
+    bool "Use experimental DMA SPI for phase stepping"
     depends on WANT_SPI_DMA
-    default y if WANT_SPI_DMA
+    default n
     help
-      Use the DMA-driven group ISR for phase stepping.  Disable to
-      revert to the legacy deferred-task polled SPI path.
+      Use the DMA-driven SPI write path for phase stepping.  This is
+      experimental; leave it disabled unless debugging DMA specifically.
+      The safe default uses the same blocking SPI transfer path as normal
+      Klipper TMC register writes.
 config WANT_I2C
     bool
     default y if WANT_GPIO_I2C || WANT_SOFTWARE_I2C
