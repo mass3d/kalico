@@ -237,14 +237,36 @@ spi_dma_default_assignment(SPI_TypeDef *spi, DMA_Stream_TypeDef **out_stream,
     return 0;
 }
 
+// Counts of successful TC and error TE events — exposed via
+// spi_dma_get_te_count() so the host can detect transient DMA errors that
+// would otherwise be invisible.  TE fires when the AHB bus reports a fault,
+// the peripheral signals an error to the DMA, or in direct mode if the
+// peripheral isn't ready.  Either way we run the same cleanup as TC so the
+// bus unwedges; the counter just makes the event observable.
+static volatile uint32_t spi_dma_te_total;
+
+uint32_t
+spi_dma_get_te_count(void)
+{
+    return spi_dma_te_total;
+}
+
 // Per-stream IRQ handler shared body.  Called from the per-stream
 // IRQHandler thunks below.  Cleans up DMA + SPI peripherals and invokes
-// the user-supplied completion callback.
+// the user-supplied completion callback.  Handles BOTH transfer-complete
+// (TC) and transfer-error (TE) — the cleanup path is identical, but on TE
+// we increment a counter and skip the EOT wait (the SPI peripheral may be
+// in an error state and never assert EOT).
 static void
-spi_dma_handle_tc(struct spi_dma_state *st, volatile uint32_t *clear_reg,
-                  uint32_t clear_mask)
+spi_dma_handle_tc(struct spi_dma_state *st, volatile uint32_t *isr_reg,
+                  volatile uint32_t *clear_reg,
+                  uint32_t teif_mask, uint32_t tcif_mask)
 {
-    *clear_reg = clear_mask;
+    uint32_t isr = *isr_reg;
+    uint8_t te_fired = (isr & teif_mask) ? 1 : 0;
+    if (te_fired)
+        spi_dma_te_total++;
+    *clear_reg = teif_mask | tcif_mask;
     st->stream->CR &= ~DMA_SxCR_EN;
     SPI_TypeDef *spi = st->spi;
     // Wait for trailing SCLK edge.  DMA TC fires when DMA finishes
@@ -256,10 +278,12 @@ spi_dma_handle_tc(struct spi_dma_state *st, volatile uint32_t *clear_reg,
     // the next byte boundary, and the TMC saw a short/garbled write and
     // ignored it.  100us covers 5-byte bursts down to 400 kHz SPI; well
     // under any realistic interval at any update rate.
-    uint32_t deadline = timer_read_time() + timer_from_us(100);
-    while ((spi->SR & SPI_SR_EOT) == 0
-           && timer_is_before(timer_read_time(), deadline))
-        ;
+    if (!te_fired) {
+        uint32_t deadline = timer_read_time() + timer_from_us(100);
+        while ((spi->SR & SPI_SR_EOT) == 0
+               && timer_is_before(timer_read_time(), deadline))
+            ;
+    }
     spi->IFCR = 0xFFFFFFFF;
     spi->CFG1 &= ~SPI_CFG1_TXDMAEN;
     spi->CR1 = SPI_CR1_SSI;
@@ -289,35 +313,40 @@ DMA1_Stream0_IRQHandler(void)
 {
     struct spi_dma_state *st = spi_dma_state_for_stream(DMA1_Stream0);
     if (st)
-        spi_dma_handle_tc(st, &DMA1->LIFCR, DMA_LIFCR_CTCIF0);
+        spi_dma_handle_tc(st, &DMA1->LISR, &DMA1->LIFCR,
+                          DMA_LIFCR_CTEIF0, DMA_LIFCR_CTCIF0);
 }
 void
 DMA1_Stream1_IRQHandler(void)
 {
     struct spi_dma_state *st = spi_dma_state_for_stream(DMA1_Stream1);
     if (st)
-        spi_dma_handle_tc(st, &DMA1->LIFCR, DMA_LIFCR_CTCIF1);
+        spi_dma_handle_tc(st, &DMA1->LISR, &DMA1->LIFCR,
+                          DMA_LIFCR_CTEIF1, DMA_LIFCR_CTCIF1);
 }
 void
 DMA1_Stream2_IRQHandler(void)
 {
     struct spi_dma_state *st = spi_dma_state_for_stream(DMA1_Stream2);
     if (st)
-        spi_dma_handle_tc(st, &DMA1->LIFCR, DMA_LIFCR_CTCIF2);
+        spi_dma_handle_tc(st, &DMA1->LISR, &DMA1->LIFCR,
+                          DMA_LIFCR_CTEIF2, DMA_LIFCR_CTCIF2);
 }
 void
 DMA1_Stream3_IRQHandler(void)
 {
     struct spi_dma_state *st = spi_dma_state_for_stream(DMA1_Stream3);
     if (st)
-        spi_dma_handle_tc(st, &DMA1->LIFCR, DMA_LIFCR_CTCIF3);
+        spi_dma_handle_tc(st, &DMA1->LISR, &DMA1->LIFCR,
+                          DMA_LIFCR_CTEIF3, DMA_LIFCR_CTCIF3);
 }
 void
 DMA1_Stream4_IRQHandler(void)
 {
     struct spi_dma_state *st = spi_dma_state_for_stream(DMA1_Stream4);
     if (st)
-        spi_dma_handle_tc(st, &DMA1->HIFCR, DMA_HIFCR_CTCIF4);
+        spi_dma_handle_tc(st, &DMA1->HISR, &DMA1->HIFCR,
+                          DMA_HIFCR_CTEIF4, DMA_HIFCR_CTCIF4);
 }
 
 // Register the IRQ handlers in the vector table.  buildcommands.py picks
@@ -366,7 +395,14 @@ spi_dma_init_bus(SPI_TypeDef *spi)
     stream->CR = (DMA_SxCR_DIR_0       // memory-to-peripheral
                   | DMA_SxCR_MINC      // memory increment
                   | DMA_SxCR_PL_1      // priority high
-                  | DMA_SxCR_TCIE);    // transfer-complete interrupt enable
+                  | DMA_SxCR_TCIE      // transfer-complete interrupt enable
+                  | DMA_SxCR_TEIE);    // transfer-error interrupt enable
+    // Without TEIE the bus wedges permanently on a single transfer error:
+    // TE doesn't fire an IRQ, the TC handler never runs, dma_wrap_done
+    // never clears spi_bus_busy, and every subsequent kick returns -1.
+    // Field-observed after ~3 million successful transfers (78s at 10kHz
+    // with 4 motors) — one transient TE was enough to kill phase stepping
+    // until reboot.
     // PSIZE / MSIZE = byte (00) — bits left at zero.
 
     // Install the per-stream IRQ at priority 1 (matches USB/CAN convention,
