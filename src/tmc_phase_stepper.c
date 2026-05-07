@@ -31,7 +31,7 @@
 // Firmware-version marker so the host can confirm a fresh reflash carries
 // the latest phase-stepping fixes.  Bump this string when MCU code changes
 // in a way the host needs to detect.  Host reads via `MCU.get_constant`.
-DECL_CONSTANT_STR("PHASE_STEPPER_VER", "v10-polled-spi-default");
+DECL_CONSTANT_STR("PHASE_STEPPER_VER", "v13-spidev-wait-for-busy");
 #include "sched.h" // sched_add_timer
 #include "spicmds.h" // spidev_kick_dma_tx
 #include "trsync.h" // trsync_add_signal

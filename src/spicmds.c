@@ -259,7 +259,26 @@ spidev_transfer(struct spidev_s *spi, uint8_t receive_data
         // Not yet initialized
         return;
 
+    // Atomically wait for any in-flight phase-stepper DMA to drain, then
+    // claim the bus.  Without this, a TMC register read that arrives mid-
+    // DMA would call spi_prepare() and overwrite SPI->CFG1 (clearing
+    // TXDMAEN) on a peripheral the DMA is still using — corrupting the
+    // in-flight transfer.  The DMA's TC IRQ then never fires, st->inflight
+    // stays at 1 forever, and every subsequent kick returns -1.  Field-
+    // observed wedge: write_count freezes across all motors because one
+    // motor's DMA was clobbered by a concurrent TMC read on the same bus.
+    //
+    // The wait is in microseconds: each DMA is a 5-byte burst at 4 MHz
+    // = 10 us peripheral time, plus DMA + IRQ-dispatch overhead.  Command
+    // threads pause briefly during phase stepping; phase stepping never
+    // reaches this wait (the kick path checks busy/hold up front).
+    irq_disable();
+    while (spi_bus_busy) {
+        irq_enable();
+        irq_disable();
+    }
     spi_bus_busy = 1;
+    irq_enable();
 
     if (CONFIG_WANT_SOFTWARE_SPI && flags & SF_SOFTWARE)
         spi_software_prepare(spi->spi_software);
