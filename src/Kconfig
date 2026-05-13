@@ -124,14 +124,17 @@ config WANT_SPI_DMA
       proven polled SPI transfer path unless PHASE_STEPPER_EXPERIMENTAL_DMA
       is explicitly enabled.
 config PHASE_STEPPER_EXPERIMENTAL_DMA
-    bool "Use experimental DMA SPI for phase stepping"
+    bool "Use DMA SPI for phase stepping"
     depends on WANT_SPI_DMA
-    default n
+    default y if WANT_SPI_DMA
     help
-      Use the DMA-driven SPI write path for phase stepping.  This is
-      experimental; leave it disabled unless debugging DMA specifically.
-      The safe default uses the same blocking SPI transfer path as normal
-      Klipper TMC register writes.
+      Use the DMA-driven SPI write path for phase stepping.  Auto-enabled
+      on boards with a DMA-coherent SRAM region (currently STM32H7 via
+      HAVE_DMA_BUF_REGION).  On boards without DMA-coherent memory
+      (RP2040, F4, G4), the polled fallback in spicmds.c is used instead.
+      Disable only when debugging the DMA chain on H7 — the polled path
+      is markedly slower and serializes 5 byte SPI bursts inside the
+      group ISR (~10 us per motor at 4 MHz).
 config WANT_I2C
     bool
     default y if WANT_GPIO_I2C || WANT_SOFTWARE_I2C

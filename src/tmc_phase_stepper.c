@@ -31,7 +31,17 @@
 // Firmware-version marker so the host can confirm a fresh reflash carries
 // the latest phase-stepping fixes.  Bump this string when MCU code changes
 // in a way the host needs to detect.  Host reads via `MCU.get_constant`.
-DECL_CONSTANT_STR("PHASE_STEPPER_VER", "v13-spidev-wait-for-busy");
+DECL_CONSTANT_STR("PHASE_STEPPER_VER", "v14-dma-poll-detect");
+
+// Signal whether this firmware uses the DMA SPI write path or the polled
+// fallback.  Host's update-rate guard uses this to pick the SPI bus-load
+// target: DMA frees the CPU so the bus can saturate further; polled
+// blocks the ISR for the whole transfer and needs a tighter cap.
+#if CONFIG_WANT_SPI_DMA && CONFIG_PHASE_STEPPER_EXPERIMENTAL_DMA
+DECL_CONSTANT("PHASE_STEPPER_DMA", 1);
+#else
+DECL_CONSTANT("PHASE_STEPPER_DMA", 0);
+#endif
 #include "sched.h" // sched_add_timer
 #include "spicmds.h" // spidev_kick_dma_tx
 #include "trsync.h" // trsync_add_signal

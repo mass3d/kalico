@@ -13,11 +13,16 @@ PHASE_ACTIVE_TPOWERDOWN = 255
 # so deploys can be verified via klippy.log.  MCU firmware version is
 # tracked separately via the PHASE_STEPPER_VER constant in
 # src/tmc_phase_stepper.c (queryable through MCU_constants).
-HOST_PHASE_STEPPER_VER = "v13-polled-rate-guard"
+HOST_PHASE_STEPPER_VER = "v14-dma-poll-detect"
 
 DEFAULT_PHASE_UPDATE_RATE = 5000.
 PHASE_SPI_BYTES_PER_MOTOR = 5
+# Bus-load caps used by _apply_update_rate_guard.  Polled blocks the CPU
+# during the full SPI transfer, so 20% bus = 20% CPU stolen from the ISR.
+# DMA frees the CPU; the cap only protects bus headroom for non-phase-
+# stepping users (TMC register reads, other SPI devices on the same bus).
 POLLED_SPI_TARGET_LOAD = 0.20
+DMA_SPI_TARGET_LOAD = 0.50
 MIN_PHASE_UPDATE_RATE = 1000.
 
 # Maximum number of position samples per flush cycle.
@@ -138,9 +143,11 @@ class MCU_phase_stepper:
         self.update_rate = self._configured_update_rate
         self._effective_rate_reason = 'configured'
         self.update_interval = 1. / self.update_rate
+        # 0.0 = auto: 0.50 if MCU firmware reports DMA, 0.20 if polled.
+        # See _apply_update_rate_guard for the resolution.
         self._phase_spi_max_bus_load = config.getfloat(
-            'phase_spi_max_bus_load', POLLED_SPI_TARGET_LOAD,
-            minval=0.05, maxval=0.50)
+            'phase_spi_max_bus_load', 0.,
+            minval=0., maxval=0.80)
         self.phase_bus = config.getint('phase_bus', 0, minval=0, maxval=3)
         self.active_tpowerdown = config.getint(
             'phase_active_tpowerdown', PHASE_ACTIVE_TPOWERDOWN,
@@ -1066,6 +1073,14 @@ class TMCPhaseStepping:
             return float(ps.tmc_obj.mcu_tmc.tmc_spi.spi.speed)
         except Exception:
             return None
+    def _mcu_dma_enabled(self, mcu):
+        """Return True if the MCU firmware was built with DMA SPI for
+        phase stepping (PHASE_STEPPER_DMA=1).  Older firmware without the
+        constant is treated as polled."""
+        try:
+            return bool(int(mcu.get_constants().get('PHASE_STEPPER_DMA', 0)))
+        except (TypeError, ValueError):
+            return False
     def _apply_update_rate_guard(self):
         if not self.phase_steppers:
             return
@@ -1080,7 +1095,13 @@ class TMCPhaseStepping:
                     " firmware timer; using the lowest configured"
                     " phase_update_rate %.0fHz for %d motors.",
                     mcu.get_name(), configured, len(steppers))
-            target_load = min(ps._phase_spi_max_bus_load for ps in steppers)
+            dma_on = self._mcu_dma_enabled(mcu)
+            auto_load = DMA_SPI_TARGET_LOAD if dma_on else POLLED_SPI_TARGET_LOAD
+            resolved_loads = [
+                (ps._phase_spi_max_bus_load
+                 if ps._phase_spi_max_bus_load > 0. else auto_load)
+                for ps in steppers]
+            target_load = min(resolved_loads)
             seconds_per_tick = 0.
             unknown_speed = False
             for ps in steppers:
@@ -1094,23 +1115,25 @@ class TMCPhaseStepping:
             effective = min(configured, safe_rate)
             raw_load = configured * seconds_per_tick
             eff_load = effective * seconds_per_tick
+            path = 'DMA' if dma_on else 'polled'
             reason = 'configured'
             if effective < configured:
                 reason = 'spi_load_guard'
                 logging.warning(
                     "Phase stepping: limiting MCU %s phase_update_rate"
-                    " from %.0fHz to %.0fHz for %d motors."
-                    " Raw polled SPI load would be %.0f%%; target is %.0f%%."
-                    " Increase the TMC spi_speed to allow a higher rate.",
+                    " from %.0fHz to %.0fHz for %d motors (%s path)."
+                    " Raw SPI bus load would be %.0f%%; target is %.0f%%."
+                    " Raise phase_spi_max_bus_load (max 0.80) or TMC"
+                    " spi_speed to allow a higher rate.",
                     mcu.get_name(), configured, effective, len(steppers),
-                    raw_load * 100., target_load * 100.)
+                    path, raw_load * 100., target_load * 100.)
             else:
                 logging.info(
                     "Phase stepping: MCU %s phase_update_rate %.0fHz uses"
-                    " %.0f%% raw polled SPI load for %d motors"
-                    " (target %.0f%%).",
+                    " %.0f%% SPI bus load for %d motors"
+                    " (%s path, target %.0f%%).",
                     mcu.get_name(), effective, eff_load * 100.,
-                    len(steppers), target_load * 100.)
+                    len(steppers), path, target_load * 100.)
             if unknown_speed:
                 logging.warning(
                     "Phase stepping: could not read one or more TMC SPI"
