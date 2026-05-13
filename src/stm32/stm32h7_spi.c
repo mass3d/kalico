@@ -447,6 +447,12 @@ spi_dma_kick_tx(void *spi_void, uint8_t *tx_buf, uint16_t len,
     // DMA before the stream pulls bytes.
     SCB_CleanDCache_by_Addr((uint32_t *)tx_buf, len);
     DMA_Stream_TypeDef *stream = st->stream;
+    // Per RM0468 §16.4.6: writing NDTR/MxAR while EN is still being torn
+    // down from the previous TC is undefined.  The TC handler cleared EN
+    // moments ago but the hardware ack may not have landed yet.  This
+    // poll is effectively zero-iteration in normal operation (IRQ exit
+    // gives the DMAC plenty of cycles) but closes the spec gap.
+    while (stream->CR & DMA_SxCR_EN) ;
     stream->NDTR = len;
     stream->M0AR = (uint32_t)tx_buf;
     stream->CR |= DMA_SxCR_EN;
