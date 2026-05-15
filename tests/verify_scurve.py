@@ -6,7 +6,7 @@ and verifies the output matches the commanded move distance exactly.
 """
 
 import sys, os, math
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'klippy'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'klippy'))
 import chelper
 
 def get_ffi():

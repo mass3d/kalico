@@ -8,10 +8,11 @@ previous one regardless of float drift in the input position stream.
 """
 
 import math
+import os
 import random
 import sys
 
-sys.path.insert(0, "/home/lpearl/kalico/klippy")
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'klippy'))
 import chelper
 
 

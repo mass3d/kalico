@@ -13,7 +13,7 @@ Tests:
 import sys, os, math
 
 # Add klippy to path so we can import chelper
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'klippy'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'klippy'))
 import chelper
 
 def get_ffi():
