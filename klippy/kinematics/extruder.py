@@ -229,6 +229,13 @@ class PrinterExtruder:
             max_accel * def_max_extrude_ratio,
             above=0.0,
         )
+        # Optional jerk cap for moves that involve extrusion. 0 = no cap
+        # (third-order motion uses the global toolhead max_jerk). When set,
+        # check_move pulls the move's jerk down on extrude-only and
+        # high-ratio moves analogously to max_extrude_only_accel.
+        self.max_e_jerk = config.getfloat(
+            "max_extrude_only_jerk", 0.0, minval=0.0
+        )
         self.max_e_dist = config.getfloat(
             "max_extrude_only_distance", 50.0, minval=0.0
         )
@@ -239,6 +246,7 @@ class PrinterExtruder:
         ffi_main, ffi_lib = chelper.get_ffi()
         self.trapq = ffi_main.gc(ffi_lib.trapq_alloc(), ffi_lib.trapq_free)
         self.trapq_append = ffi_lib.trapq_append
+        self.trapq_append_scurve = ffi_lib.trapq_append_scurve
         self.trapq_finalize_moves = ffi_lib.trapq_finalize_moves
 
         # Setup extruder stepper
@@ -307,6 +315,8 @@ class PrinterExtruder:
                 self.max_e_velocity * inv_extrude_r,
                 self.max_e_accel * inv_extrude_r,
             )
+            if self.max_e_jerk > 0.0:
+                move.limit_jerk(self.max_e_jerk * inv_extrude_r)
         elif axis_r > self.max_extrude_ratio:
             if move.axes_d[3] <= self.nozzle_diameter * self.max_extrude_ratio:
                 # Permit extrusion if amount extruded is tiny
@@ -343,23 +353,53 @@ class PrinterExtruder:
                 use_pa_from_trapq = 1.0
             if axis_r > 0.0 and (move.axes_d[0] or move.axes_d[1]):
                 pressure_advance = self.extruder_stepper.pressure_advance
-        # Queue movement (x is extruder movement, y is pressure advance flag)
-        self.trapq_append(
-            self.trapq,
-            print_time,
-            move.accel_t,
-            move.cruise_t,
-            move.decel_t,
-            move.start_pos[3],
-            0.0,
-            0.0,
-            1.0,
-            pressure_advance,
-            use_pa_from_trapq,
-            start_v,
-            cruise_v,
-            accel,
-        )
+        # Dispatch s-curve when the upstream toolhead move ran the
+        # jerk-limited planner. The extruder shares the same phase
+        # durations (tj1/ta/tc/tj2/td) as the XYZ move and scales the
+        # velocity/accel/jerk polynomial by axis_r so retraction direction
+        # comes through with the right sign.
+        # x is the extruder direction (always 1.0); y/z are overloaded as
+        # the pressure-advance scalar and use-PA flag, consumed only by
+        # extruder_calc_position on the extruder trapq.
+        if hasattr(move, "scurve_jerk"):
+            jerk = move.scurve_jerk * axis_r
+            self.trapq_append_scurve(
+                self.trapq,
+                print_time,
+                move.start_pos[3],
+                0.0,
+                0.0,
+                1.0,
+                pressure_advance,
+                use_pa_from_trapq,
+                start_v,
+                jerk,
+                accel,
+                cruise_v,
+                move.scurve_tj1,
+                move.scurve_ta,
+                move.scurve_tc,
+                move.scurve_tj2,
+                move.scurve_td,
+            )
+        else:
+            # Queue movement (x is extruder movement, y is PA flag)
+            self.trapq_append(
+                self.trapq,
+                print_time,
+                move.accel_t,
+                move.cruise_t,
+                move.decel_t,
+                move.start_pos[3],
+                0.0,
+                0.0,
+                1.0,
+                pressure_advance,
+                use_pa_from_trapq,
+                start_v,
+                cruise_v,
+                accel,
+            )
         self.last_position = move.end_pos[3]
 
     def find_past_position(self, print_time):

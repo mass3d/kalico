@@ -26,27 +26,35 @@
 //         / ((smooth_time/2)**2))
 
 // Calculate the definitive integral of the motion formula:
-//   position(t) = base + t * (start_v + t * half_accel)
+//   position(t) = base + t * (start_v + t * (half_accel + t * sixth_jerk))
+// (sixth_jerk = jerk/6, and is zero for second-order moves).
 static double
 extruder_integrate(double base, double start_v, double half_accel
-                   , double start, double end)
+                   , double sixth_jerk, double start, double end)
 {
     double half_v = .5 * start_v, sixth_a = (1. / 3.) * half_accel;
-    double si = start * (base + start * (half_v + start * sixth_a));
-    double ei = end * (base + end * (half_v + end * sixth_a));
+    double eighth_j = .25 * sixth_jerk;
+    double si = start * (base + start * (half_v
+                  + start * (sixth_a + start * eighth_j)));
+    double ei = end * (base + end * (half_v
+                  + end * (sixth_a + end * eighth_j)));
     return ei - si;
 }
 
 // Calculate the definitive integral of time weighted position:
-//   weighted_position(t) = t * (base + t * (start_v + t * half_accel))
+//   weighted_position(t) = t * (base + t * (start_v + t * (half_accel
+//                                                          + t * sixth_jerk)))
 static double
 extruder_integrate_time(double base, double start_v, double half_accel
-                        , double start, double end)
+                        , double sixth_jerk, double start, double end)
 {
     double half_b = .5 * base, third_v = (1. / 3.) * start_v;
     double eighth_a = .25 * half_accel;
-    double si = start * start * (half_b + start * (third_v + start * eighth_a));
-    double ei = end * end * (half_b + end * (third_v + end * eighth_a));
+    double fifth_j = (1. / 5.) * sixth_jerk;
+    double si = start * start * (half_b + start * (third_v
+                  + start * (eighth_a + start * fifth_j)));
+    double ei = end * end * (half_b + end * (third_v
+                  + end * (eighth_a + end * fifth_j)));
     return ei - si;
 }
 
@@ -72,13 +80,22 @@ pa_move_integrate(struct move *m, double pressure_advance
         if (!can_pressure_advance)
             pressure_advance = 0.;
     }
-    // Calculate base position and velocity with pressure advance
+    // Calculate base position and velocity with pressure advance.
+    // PA shifts the position polynomial by pressure_advance * velocity(t).
+    // For a cubic move p(t) = base + sv*t + ha*t^2 + sj*t^3 the velocity is
+    //   dp/dt = sv + 2*ha*t + 3*sj*t^2,
+    // so after applying PA the coefficients become:
+    //   base       += PA * sv
+    //   start_v    += PA * 2 * ha
+    //   half_accel += PA * 3 * sj
+    //   sixth_jerk  = unchanged
     base += pressure_advance * m->start_v;
     double start_v = m->start_v + pressure_advance * 2. * m->half_accel;
+    double ha = m->half_accel + pressure_advance * 3. * m->sixth_jerk;
+    double sj = m->sixth_jerk;
     // Calculate definitive integral
-    double ha = m->half_accel;
-    double iext = extruder_integrate(base, start_v, ha, start, end);
-    double wgt_ext = extruder_integrate_time(base, start_v, ha, start, end);
+    double iext = extruder_integrate(base, start_v, ha, sj, start, end);
+    double wgt_ext = extruder_integrate_time(base, start_v, ha, sj, start, end);
     return wgt_ext - time_offset * iext;
 }
 
