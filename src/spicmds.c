@@ -190,9 +190,9 @@ dma_wrap_done(void *ctx)
         user_cb(user_ctx);
 }
 
-int
-spidev_kick_dma_tx(struct spidev_s *spi, uint8_t *tx_buf, uint16_t len,
-                   spi_dma_done_fn cb, void *ctx)
+static int
+kick_dma_tx_impl(struct spidev_s *spi, uint8_t *tx_buf, uint16_t len,
+                 spi_dma_done_fn cb, void *ctx, uint8_t do_prepare)
 {
     uint_fast8_t flags = spi->flags;
     if (!(flags & SF_HARDWARE))
@@ -203,7 +203,8 @@ spidev_kick_dma_tx(struct spidev_s *spi, uint8_t *tx_buf, uint16_t len,
     active_dma_wrap.spi = spi;
     active_dma_wrap.user_cb = cb;
     active_dma_wrap.user_ctx = ctx;
-    spi_prepare(spi->spi_config);
+    if (do_prepare)
+        spi_prepare(spi->spi_config);
     if (flags & SF_HAVE_PIN)
         gpio_out_write(spi->pin, !!(flags & SF_CS_ACTIVE_HIGH));
     int rc = spi_dma_kick_tx(spi->spi_config.spi, tx_buf, len,
@@ -217,6 +218,20 @@ spidev_kick_dma_tx(struct spidev_s *spi, uint8_t *tx_buf, uint16_t len,
         spi_bus_busy = 0;
     }
     return rc;
+}
+
+int
+spidev_kick_dma_tx(struct spidev_s *spi, uint8_t *tx_buf, uint16_t len,
+                   spi_dma_done_fn cb, void *ctx)
+{
+    return kick_dma_tx_impl(spi, tx_buf, len, cb, ctx, /*do_prepare=*/1);
+}
+
+int
+spidev_kick_dma_tx_chained(struct spidev_s *spi, uint8_t *tx_buf, uint16_t len,
+                           spi_dma_done_fn cb, void *ctx)
+{
+    return kick_dma_tx_impl(spi, tx_buf, len, cb, ctx, /*do_prepare=*/0);
 }
 
 uint8_t
@@ -240,6 +255,16 @@ spidev_kick_dma_tx(struct spidev_s *spi, uint8_t *tx_buf, uint16_t len,
     if (cb)
         cb(ctx);
     return 0;
+}
+
+int
+spidev_kick_dma_tx_chained(struct spidev_s *spi, uint8_t *tx_buf, uint16_t len,
+                           spi_dma_done_fn cb, void *ctx)
+{
+    // Polled path has no separate "prepared bus" state — every transfer
+    // goes through spidev_transfer which prepares from scratch.  The
+    // chained variant is identical to the non-chained polled call.
+    return spidev_kick_dma_tx(spi, tx_buf, len, cb, ctx);
 }
 
 uint8_t

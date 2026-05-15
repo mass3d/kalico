@@ -31,7 +31,7 @@
 // Firmware-version marker so the host can confirm a fresh reflash carries
 // the latest phase-stepping fixes.  Bump this string when MCU code changes
 // in a way the host needs to detect.  Host reads via `MCU.get_constant`.
-DECL_CONSTANT_STR("PHASE_STEPPER_VER", "v14-dma-poll-detect");
+DECL_CONSTANT_STR("PHASE_STEPPER_VER", "v15-chain-prepare-skip");
 
 // Signal whether this firmware uses the DMA SPI write path or the polled
 // fallback.  Host's update-rate guard uses this to pick the SPI bus-load
@@ -313,6 +313,13 @@ group_phase_stepper_event(struct timer *t)
 // motor has its own CS pin (different spidev_s), so we issue one DMA of
 // 5 bytes per motor with CS pulses between.  spidev_kick_dma_tx pulls CS
 // low; bus_dma_done raises it and kicks the next.
+//
+// For motors after the first on the same bus, use the chained variant
+// that skips spi_prepare() — all phase-stepping TMCs share one SPI bus
+// at one speed/mode, so reprogramming CFG1/CFG2 each motor is wasted
+// time.  Saves ~250ns per call × 3 motors = ~750ns of tick budget per
+// chain.  At 6 MHz / 30 kHz this can be the margin between fitting and
+// the 50% skip pattern (chain time ~33.4us vs tick period 33.3us).
 static void
 kick_next_dma_in_bus(struct phase_bus_group *bg)
 {
@@ -326,8 +333,13 @@ kick_next_dma_in_bus(struct phase_bus_group *bg)
     struct tmc_phase_stepper *ps = bg->motors[motor_idx];
     uint8_t b = ps->bus_index;
     uint8_t *tx = &bus_tx_buf[b][bg->cur_motor * BYTES_PER_MOTOR];
-    int rc = spidev_kick_dma_tx(ps->spi, tx, BYTES_PER_MOTOR,
+    int rc;
+    if (bg->cur_motor == 0)
+        rc = spidev_kick_dma_tx(ps->spi, tx, BYTES_PER_MOTOR,
                                 bus_dma_done, bg);
+    else
+        rc = spidev_kick_dma_tx_chained(ps->spi, tx, BYTES_PER_MOTOR,
+                                        bus_dma_done, bg);
     if (rc != 0) {
         // Bus contention — drop this and remaining motors for this tick.
         for (uint8_t i = bg->cur_motor; i < bg->pending_count; i++) {

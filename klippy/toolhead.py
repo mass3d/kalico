@@ -23,6 +23,8 @@ class Move:
         self.start_pos = tuple(start_pos)
         self.end_pos = tuple(end_pos)
         self.accel = toolhead.max_accel
+        # Per-move jerk cap, may be lowered by kinematics/extruder check_move
+        self.max_jerk = toolhead.max_jerk
         self.junction_deviation = toolhead.junction_deviation
         self.timing_callbacks = []
         velocity = min(speed, toolhead.max_velocity)
@@ -68,6 +70,9 @@ class Move:
         self.delta_v2 = 2.0 * self.move_d * self.accel
         self.smooth_delta_v2 = min(self.smooth_delta_v2, self.delta_v2)
 
+    def limit_jerk(self, jerk):
+        self.max_jerk = min(self.max_jerk, jerk)
+
     def limit_next_junction_speed(self, speed):
         self.next_junction_v2 = min(self.next_junction_v2, speed**2)
 
@@ -79,6 +84,16 @@ class Move:
     def calc_junction(self, prev_move):
         if not self.is_kinematic_move or not prev_move.is_kinematic_move:
             return
+        # Third-order "extruder priority" rule: when jerk-limited motion is
+        # active, force a complete stop at any print<->travel boundary so
+        # the extruder's PA-applied velocity profile doesn't pick up an
+        # instantaneous step from a kinematic-only junction. Returning here
+        # leaves max_start_v2 / max_smoothed_v2 at their __init__ defaults
+        # (0.0), which is exactly the hard stop we want. (RRF docs: "always
+        # comes to a stop between extruding and non-extruding moves.")
+        if self.toolhead.max_jerk > 0.0:
+            if bool(self.axes_d[3]) != bool(prev_move.axes_d[3]):
+                return
         # Allow extruder to calculate its maximum junction
         extruder_v2 = self.toolhead.extruder.calc_junction(prev_move, self)
         max_start_v2 = min(
@@ -122,8 +137,15 @@ class Move:
         )
 
     def set_junction(self, start_v2, cruise_v2, end_v2):
-        max_jerk = self.toolhead.max_jerk
-        if max_jerk > 0. and self.is_kinematic_move:
+        max_jerk = self.max_jerk
+        # Third-order motion only fires when there is XY (or XY+E) motion.
+        # Pure Z moves (Z hops, homing offsets) are slow single-axis moves
+        # that gain nothing from jerk limiting — RRF's documented benefit
+        # is PA continuity and XY resonance damping, neither of which
+        # applies to Z. Falling through to the trapezoidal branch here
+        # avoids spending the 7-phase planning budget on Z-only motion.
+        has_xy = self.axes_d[0] or self.axes_d[1]
+        if max_jerk > 0. and self.is_kinematic_move and has_xy:
             return self._set_junction_scurve(
                 start_v2, cruise_v2, end_v2, max_jerk)
         # Determine accel, cruise, and decel portions of the move distance
