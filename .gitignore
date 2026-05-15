@@ -23,3 +23,12 @@ site/
 env/
 venv/
 mkdocs-env/
+
+# phase-stepping development scratch
+*.tar.gz
+debuglogs/
+testlogs.log
+HANDOFF.md
+CLAUDE.md
+.codex
+lpearl@*
